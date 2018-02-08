@@ -31,6 +31,7 @@ const (
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -41,15 +42,12 @@ type testKVSuite struct {
 }
 
 func (s *testKVSuite) SetUpSuite(c *C) {
-	s.bs = make([]MemBuffer, 2)
-	s.bs[0] = NewRBTreeBuffer()
-	s.bs[1] = NewMemDbBuffer()
+	s.bs = make([]MemBuffer, 1)
+	s.bs[0] = NewMemDbBuffer(DefaultTxnMembufCap)
 }
 
-func (s *testKVSuite) TearDownSuite(c *C) {
-	for _, buffer := range s.bs {
-		buffer.Release()
-	}
+func (s *testKVSuite) ResetMembuffers() {
+	s.bs[0] = NewMemDbBuffer(DefaultTxnMembufCap)
 }
 
 func insertData(c *C, buffer MemBuffer) {
@@ -120,14 +118,6 @@ func checkNewIterator(c *C, buffer MemBuffer) {
 	iter.Close()
 }
 
-func mustNotGet(c *C, buffer MemBuffer) {
-	for i := startIndex; i < testCount; i++ {
-		s := encodeInt(i * indexStep)
-		_, err := buffer.Get(s)
-		c.Assert(err, NotNil)
-	}
-}
-
 func mustGet(c *C, buffer MemBuffer) {
 	for i := startIndex; i < testCount; i++ {
 		s := encodeInt(i * indexStep)
@@ -142,8 +132,8 @@ func (s *testKVSuite) TestGetSet(c *C) {
 	for _, buffer := range s.bs {
 		insertData(c, buffer)
 		mustGet(c, buffer)
-		buffer.Release()
 	}
+	s.ResetMembuffers()
 }
 
 func (s *testKVSuite) TestNewIterator(c *C) {
@@ -156,8 +146,23 @@ func (s *testKVSuite) TestNewIterator(c *C) {
 
 		insertData(c, buffer)
 		checkNewIterator(c, buffer)
-		buffer.Release()
 	}
+	s.ResetMembuffers()
+}
+
+func (s *testKVSuite) TestIterNextUntil(c *C) {
+	defer testleak.AfterTest(c)()
+	buffer := NewMemDbBuffer(DefaultTxnMembufCap)
+	insertData(c, buffer)
+
+	iter, err := buffer.Seek(nil)
+	c.Assert(err, IsNil)
+
+	err = NextUntil(iter, func(k Key) bool {
+		return false
+	})
+	c.Assert(err, IsNil)
+	c.Assert(iter.Valid(), IsFalse)
 }
 
 func (s *testKVSuite) TestBasicNewIterator(c *C) {
@@ -166,7 +171,6 @@ func (s *testKVSuite) TestBasicNewIterator(c *C) {
 		it, err := buffer.Seek([]byte("2"))
 		c.Assert(err, IsNil)
 		c.Assert(it.Valid(), IsFalse)
-		buffer.Release()
 	}
 }
 
@@ -200,44 +204,43 @@ func (s *testKVSuite) TestNewIteratorMin(c *C) {
 		it, err = buffer.Seek([]byte("DATA_test_main_db_tbl_tbl_test_record__00000000000000000000"))
 		c.Assert(err, IsNil)
 		c.Assert(string(it.Key()), Equals, "DATA_test_main_db_tbl_tbl_test_record__00000000000000000001")
-
-		buffer.Release()
 	}
+	s.ResetMembuffers()
+}
+
+func (s *testKVSuite) TestBufferLimit(c *C) {
+	buffer := NewMemDbBuffer(DefaultTxnMembufCap).(*memDbBuffer)
+	buffer.bufferSizeLimit = 1000
+	buffer.entrySizeLimit = 500
+	var err error
+
+	err = buffer.Set([]byte("x"), make([]byte, 500))
+	c.Assert(err, NotNil) // entry size limit
+
+	err = buffer.Set([]byte("x"), make([]byte, 499))
+	c.Assert(err, IsNil)
+	err = buffer.Set([]byte("yz"), make([]byte, 499))
+	c.Assert(err, NotNil) // buffer size limit
+
+	buffer = NewMemDbBuffer(DefaultTxnMembufCap).(*memDbBuffer)
+	buffer.bufferLenLimit = 10
+	for i := 0; i < 10; i++ {
+		err = buffer.Set([]byte{byte(i)}, []byte{byte(i)})
+		c.Assert(err, IsNil)
+	}
+	err = buffer.Set([]byte("x"), []byte("y"))
+	c.Assert(err, NotNil) // buffer len limit
 }
 
 var opCnt = 100000
-
-func BenchmarkRBTreeBufferSequential(b *testing.B) {
-	data := make([][]byte, opCnt)
-	for i := 0; i < opCnt; i++ {
-		data[i] = encodeInt(i)
-	}
-	buffer := NewRBTreeBuffer()
-	benchmarkSetGet(b, buffer, data)
-	buffer.Release()
-	b.ReportAllocs()
-}
-
-func BenchmarkRBTreeBufferRandom(b *testing.B) {
-	data := make([][]byte, opCnt)
-	for i := 0; i < opCnt; i++ {
-		data[i] = encodeInt(i)
-	}
-	shuffle(data)
-	buffer := NewRBTreeBuffer()
-	benchmarkSetGet(b, buffer, data)
-	buffer.Release()
-	b.ReportAllocs()
-}
 
 func BenchmarkMemDbBufferSequential(b *testing.B) {
 	data := make([][]byte, opCnt)
 	for i := 0; i < opCnt; i++ {
 		data[i] = encodeInt(i)
 	}
-	buffer := NewMemDbBuffer()
+	buffer := NewMemDbBuffer(DefaultTxnMembufCap)
 	benchmarkSetGet(b, buffer, data)
-	buffer.Release()
 	b.ReportAllocs()
 }
 
@@ -247,38 +250,20 @@ func BenchmarkMemDbBufferRandom(b *testing.B) {
 		data[i] = encodeInt(i)
 	}
 	shuffle(data)
-	buffer := NewMemDbBuffer()
+	buffer := NewMemDbBuffer(DefaultTxnMembufCap)
 	benchmarkSetGet(b, buffer, data)
-	buffer.Release()
-	b.ReportAllocs()
-}
-
-func BenchmarkRBTreeIter(b *testing.B) {
-	buffer := NewRBTreeBuffer()
-	benchIterator(b, buffer)
-	buffer.Release()
 	b.ReportAllocs()
 }
 
 func BenchmarkMemDbIter(b *testing.B) {
-	buffer := NewMemDbBuffer()
+	buffer := NewMemDbBuffer(DefaultTxnMembufCap)
 	benchIterator(b, buffer)
-	buffer.Release()
-	b.ReportAllocs()
-}
-
-func BenchmarkRBTreeCreation(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		buffer := NewRBTreeBuffer()
-		buffer.Release()
-	}
 	b.ReportAllocs()
 }
 
 func BenchmarkMemDbCreation(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		buffer := NewMemDbBuffer()
-		buffer.Release()
+		NewMemDbBuffer(DefaultTxnMembufCap)
 	}
 	b.ReportAllocs()
 }

@@ -15,46 +15,58 @@ package executor
 
 import (
 	"github.com/juju/errors"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/infoschema"
-	"github.com/pingcap/tidb/optimizer"
-	"github.com/pingcap/tidb/optimizer/plan"
-	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/plan"
+	log "github.com/sirupsen/logrus"
+	goctx "golang.org/x/net/context"
 )
 
-// Compiler compiles an ast.StmtNode to a stmt.Statement.
+// Compiler compiles an ast.StmtNode to a physical plan.
 type Compiler struct {
+	Ctx context.Context
 }
 
-// Compile compiles an ast.StmtNode to a stmt.Statement.
-// If it is supported to use new plan and executer, it optimizes the node to
-// a plan, and we wrap the plan in an adapter as stmt.Statement.
-// If it is not supported, the node will be converted to old statement.
-func (c *Compiler) Compile(ctx context.Context, node ast.StmtNode) (ast.Statement, error) {
-	ast.SetFlag(node)
+// Compile compiles an ast.StmtNode to a physical plan.
+func (c *Compiler) Compile(goCtx goctx.Context, stmtNode ast.StmtNode) (*ExecStmt, error) {
+	if span := opentracing.SpanFromContext(goCtx); span != nil {
+		span1 := opentracing.StartSpan("executor.Compile", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+	}
 
-	is := sessionctx.GetDomain(ctx).InfoSchema()
-	if err := optimizer.Preprocess(node, is, ctx); err != nil {
+	infoSchema := GetInfoSchema(c.Ctx)
+	if err := plan.Preprocess(c.Ctx, stmtNode, infoSchema, false); err != nil {
 		return nil, errors.Trace(err)
 	}
-	// Validate should be after NameResolve.
-	if err := optimizer.Validate(node, false); err != nil {
-		return nil, errors.Trace(err)
-	}
-	sb := NewSubQueryBuilder(is)
-	p, err := optimizer.Optimize(ctx, node, sb)
+
+	finalPlan, err := plan.Optimize(c.Ctx, stmtNode, infoSchema)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	sa := &statement{
-		is:   is,
-		plan: p,
-	}
-	return sa, nil
+
+	return &ExecStmt{
+		InfoSchema: infoSchema,
+		Plan:       finalPlan,
+		Expensive:  stmtCount(stmtNode, finalPlan, c.Ctx.GetSessionVars().InRestrictedSQL),
+		Cacheable:  plan.Cacheable(stmtNode),
+		Text:       stmtNode.Text(),
+		StmtNode:   stmtNode,
+		Ctx:        c.Ctx,
+	}, nil
 }
 
-// NewSubQueryBuilder builds and returns a new SubQuery builder.
-func NewSubQueryBuilder(is infoschema.InfoSchema) plan.SubQueryBuilder {
-	return &subqueryBuilder{is: is}
+// GetInfoSchema gets TxnCtx InfoSchema if snapshot schema is not set,
+// Otherwise, snapshot schema is returned.
+func GetInfoSchema(ctx context.Context) infoschema.InfoSchema {
+	sessVar := ctx.GetSessionVars()
+	var is infoschema.InfoSchema
+	if snap := sessVar.SnapshotInfoschema; snap != nil {
+		is = snap.(infoschema.InfoSchema)
+		log.Infof("[%d] use snapshot schema %d", sessVar.ConnectionID, is.SchemaMetaVersion())
+	} else {
+		is = sessVar.TxnCtx.InfoSchema.(infoschema.InfoSchema)
+	}
+	return is
 }

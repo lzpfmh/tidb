@@ -1,4 +1,4 @@
-// Copyright 2015 PingCAP, Inc.
+// Copyright 2017 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,46 +11,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package table_test
+package table
 
 import (
-	"testing"
-
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/sessionctx/db"
-	"github.com/pingcap/tidb/store/localstore"
-	"github.com/pingcap/tidb/store/localstore/goleveldb"
 )
 
-func TestT(t *testing.T) {
-	TestingT(t)
-}
+var _ = Suite(&testTableSuite{})
 
-var _ = Suite(&testSuite{})
+type testTableSuite struct{}
 
-type testSuite struct {
-}
-
-func (*testSuite) TestT(c *C) {
-	var ident = ast.Ident{
-		Name: model.NewCIStr("t"),
-	}
-	c.Assert(ident.String(), Not(Equals), "")
-	driver := localstore.Driver{Driver: goleveldb.MemoryDriver{}}
-	store, err := driver.Open("memory")
-	c.Assert(err, IsNil)
-	se, err := tidb.CreateSession(store)
-	c.Assert(err, IsNil)
-	ctx := se.(context.Context)
-	db.BindCurrentSchema(ctx, "test")
-	fullIdent := ident.Full(ctx)
-	c.Assert(fullIdent.Schema.L, Equals, "test")
-	c.Assert(fullIdent.Name.L, Equals, "t")
-	c.Assert(fullIdent.String(), Not(Equals), "")
-	fullIdent2 := fullIdent.Full(ctx)
-	c.Assert(fullIdent2.Schema.L, Equals, fullIdent.Schema.L)
+func (t *testTableSuite) TestSlice(c *C) {
+	sl := make(Slice, 2)
+	length := sl.Len()
+	c.Assert(length, Equals, 2)
+	sl.Swap(0, 1)
 }

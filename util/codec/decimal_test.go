@@ -15,7 +15,8 @@ package codec
 
 import (
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/testleak"
 )
 
@@ -45,10 +46,37 @@ func (s *testDecimalSuite) TestDecimalCodec(c *C) {
 	}
 
 	for _, input := range inputs {
-		v := mysql.NewDecimalFromFloat(input.Input)
-		b := EncodeDecimal([]byte{}, v)
+		v := types.NewDecFromFloatForTest(input.Input)
+		datum := types.NewDatum(v)
+		b := EncodeDecimal([]byte{}, datum.GetMysqlDecimal(), datum.Length(), datum.Frac())
 		_, d, err := DecodeDecimal(b)
 		c.Assert(err, IsNil)
-		c.Assert(v.Equals(d), IsTrue)
+		c.Assert(v.Compare(d.GetMysqlDecimal()), Equals, 0)
 	}
+}
+
+func (s *testDecimalSuite) TestFrac(c *C) {
+	defer testleak.AfterTest(c)()
+	inputs := []struct {
+		Input *types.MyDecimal
+	}{
+		{types.NewDecFromInt(3)},
+		{types.NewDecFromFloatForTest(0.03)},
+	}
+	for _, v := range inputs {
+		testFrac(c, v.Input)
+	}
+}
+
+func testFrac(c *C, v *types.MyDecimal) {
+	var d1 types.Datum
+	d1.SetMysqlDecimal(v)
+	b := EncodeDecimal([]byte{}, d1.GetMysqlDecimal(), d1.Length(), d1.Frac())
+	_, d2, err := DecodeDecimal(b)
+	c.Assert(err, IsNil)
+	sc := new(stmtctx.StatementContext)
+	cmp, err := d1.CompareDatum(sc, &d2)
+	c.Assert(err, IsNil)
+	c.Assert(cmp, Equals, 0)
+	c.Assert(d1.GetMysqlDecimal().String(), Equals, d2.GetMysqlDecimal().String())
 }

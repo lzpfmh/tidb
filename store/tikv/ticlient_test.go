@@ -19,39 +19,20 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/store/tikv/mock-tikv"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/util/codec"
+	goctx "golang.org/x/net/context"
 )
 
 var (
-	withTiKV     = flag.Bool("with-tikv", false, "run tests with TiKV cluster started. (not use the mock server)")
-	etcdAddrs    = flag.String("etcd-addrs", "127.0.0.1:2379", "etcd addrs")
-	pdLeaderPath = flag.String("pd-path", "/pd", "PD leader path on etcd")
-	clusterID    = flag.Int("cluster", 1, "cluster ID")
+	withTiKV = flag.Bool("with-tikv", false, "run tests with TiKV cluster started. (not use the mock server)")
+	pdAddrs  = flag.String("pd-addrs", "127.0.0.1:2379", "pd addrs")
 )
 
 func newTestStore(c *C) *tikvStore {
-	if !flag.Parsed() {
-		flag.Parse()
-	}
-
-	if *withTiKV {
-		var d Driver
-		store, err := d.Open(fmt.Sprintf("tikv://%s%s?cluster=%d", *etcdAddrs, *pdLeaderPath, *clusterID))
-		c.Assert(err, IsNil)
-		return store.(*tikvStore)
-	}
-	cluster := mocktikv.NewCluster()
-	mocktikv.BootstrapWithSingleStore(cluster)
-	mvccStore := mocktikv.NewMvccStore()
-	clientFactory := mockClientFactory(cluster, mvccStore)
-	return newTikvStore("mock-tikv-store", mocktikv.NewPDClient(cluster), clientFactory)
-}
-
-func mockClientFactory(cluster *mocktikv.Cluster, mvccStore *mocktikv.MvccStore) ClientFactory {
-	return func(addr string) (Client, error) {
-		return mocktikv.NewRPCClient(cluster, mvccStore, addr), nil
-	}
+	store, err := NewTestTiKVStorage(*withTiKV, *pdAddrs)
+	c.Assert(err, IsNil)
+	return store.(*tikvStore)
 }
 
 type testTiclientSuite struct {
@@ -80,7 +61,7 @@ func (s *testTiclientSuite) TearDownSuite(c *C) {
 		c.Assert(err, IsNil)
 		scanner.Next()
 	}
-	err = txn.Commit()
+	err = txn.Commit(goctx.Background())
 	c.Assert(err, IsNil)
 	err = s.store.Close()
 	c.Assert(err, IsNil)
@@ -98,7 +79,7 @@ func (s *testTiclientSuite) TestSingleKey(c *C) {
 	c.Assert(err, IsNil)
 	err = txn.LockKeys(encodeKey(s.prefix, "key"))
 	c.Assert(err, IsNil)
-	err = txn.Commit()
+	err = txn.Commit(goctx.Background())
 	c.Assert(err, IsNil)
 
 	txn = s.beginTxn(c)
@@ -109,7 +90,7 @@ func (s *testTiclientSuite) TestSingleKey(c *C) {
 	txn = s.beginTxn(c)
 	err = txn.Delete(encodeKey(s.prefix, "key"))
 	c.Assert(err, IsNil)
-	err = txn.Commit()
+	err = txn.Commit(goctx.Background())
 	c.Assert(err, IsNil)
 }
 
@@ -121,7 +102,7 @@ func (s *testTiclientSuite) TestMultiKeys(c *C) {
 		err := txn.Set(encodeKey(s.prefix, s08d("key", i)), valueBytes(i))
 		c.Assert(err, IsNil)
 	}
-	err := txn.Commit()
+	err := txn.Commit(goctx.Background())
 	c.Assert(err, IsNil)
 
 	txn = s.beginTxn(c)
@@ -136,35 +117,24 @@ func (s *testTiclientSuite) TestMultiKeys(c *C) {
 		err = txn.Delete(encodeKey(s.prefix, s08d("key", i)))
 		c.Assert(err, IsNil)
 	}
-	err = txn.Commit()
+	err = txn.Commit(goctx.Background())
 	c.Assert(err, IsNil)
-}
-
-func (s *testTiclientSuite) TestCleanLock(c *C) {
-	const keyNum = 10
-
-	txn := s.beginTxn(c)
-	for i := 0; i < keyNum; i++ {
-		err := txn.Set(encodeKey(s.prefix, s08d("key", i)), valueBytes(i))
-		c.Assert(err, IsNil)
-	}
-	txn.DONOTCOMMIT = true
-	err := txn.Commit()
-	c.Assert(err, IsNil)
-
-	txn2 := s.beginTxn(c)
-	for i := 0; i < keyNum; i++ {
-		err2 := txn2.Set(encodeKey(s.prefix, s08d("key", i)), valueBytes(i+1))
-		c.Assert(err2, IsNil)
-	}
-	err2 := txn2.Commit()
-	c.Assert(err2, IsNil)
 }
 
 func (s *testTiclientSuite) TestNotExist(c *C) {
 	txn := s.beginTxn(c)
 	_, err := txn.Get(encodeKey(s.prefix, "noSuchKey"))
 	c.Assert(err, NotNil)
+}
+
+func (s *testTiclientSuite) TestLargeRequest(c *C) {
+	largeValue := make([]byte, 9*1024*1024) // 9M value.
+	txn := s.beginTxn(c)
+	err := txn.Set([]byte("key"), largeValue)
+	c.Assert(err, NotNil)
+	err = txn.Commit(goctx.Background())
+	c.Assert(err, IsNil)
+	c.Assert(kv.IsRetryableError(err), IsFalse)
 }
 
 func encodeKey(prefix, s string) []byte {

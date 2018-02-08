@@ -37,66 +37,80 @@ package server
 import (
 	"bufio"
 	"io"
-	"net"
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/terror"
 )
 
-const (
-	defaultReaderSize = 16 * 1024
-	defaultWriterSize = 16 * 1024
-)
+const defaultWriterSize = 16 * 1024
 
+// packetIO is a helper to read and write data in packet format.
 type packetIO struct {
-	rb *bufio.Reader
-	wb *bufio.Writer
-
-	sequence uint8
+	bufReadConn *bufferedReadConn
+	bufWriter   *bufio.Writer
+	sequence    uint8
 }
 
-func newPacketIO(conn net.Conn) *packetIO {
-	p := &packetIO{
-		rb: bufio.NewReaderSize(conn, defaultReaderSize),
-		wb: bufio.NewWriterSize(conn, defaultWriterSize),
-	}
-
+func newPacketIO(bufReadConn *bufferedReadConn) *packetIO {
+	p := &packetIO{sequence: 0}
+	p.setBufferedReadConn(bufReadConn)
 	return p
 }
 
-func (p *packetIO) readPacket() ([]byte, error) {
+func (p *packetIO) setBufferedReadConn(bufReadConn *bufferedReadConn) {
+	p.bufReadConn = bufReadConn
+	p.bufWriter = bufio.NewWriterSize(bufReadConn, defaultWriterSize)
+}
+
+func (p *packetIO) readOnePacket() ([]byte, error) {
 	var header [4]byte
 
-	if _, err := io.ReadFull(p.rb, header[:]); err != nil {
+	if _, err := io.ReadFull(p.bufReadConn, header[:]); err != nil {
 		return nil, errors.Trace(err)
 	}
 
-	length := int(uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16)
-	if length < 1 {
-		return nil, errors.Errorf("invalid payload length %d", length)
-	}
-
-	sequence := uint8(header[3])
+	sequence := header[3]
 	if sequence != p.sequence {
-		return nil, errors.Errorf("invalid sequence %d != %d", sequence, p.sequence)
+		return nil, errInvalidSequence.Gen("invalid sequence %d != %d", sequence, p.sequence)
 	}
 
 	p.sequence++
 
+	length := int(uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16)
+
 	data := make([]byte, length)
-	if _, err := io.ReadFull(p.rb, data); err != nil {
+	if _, err := io.ReadFull(p.bufReadConn, data); err != nil {
 		return nil, errors.Trace(err)
 	}
-	if length < mysql.MaxPayloadLen {
-		return data, nil
-	}
+	return data, nil
+}
 
-	var buf []byte
-	buf, err := p.readPacket()
+func (p *packetIO) readPacket() ([]byte, error) {
+	data, err := p.readOnePacket()
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	return append(data, buf...), nil
+
+	if len(data) < mysql.MaxPayloadLen {
+		return data, nil
+	}
+
+	// handle multi-packet
+	for {
+		buf, err := p.readOnePacket()
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+
+		data = append(data, buf...)
+
+		if len(buf) < mysql.MaxPayloadLen {
+			break
+		}
+	}
+
+	return data, nil
 }
 
 // writePacket writes data that already have header
@@ -110,7 +124,7 @@ func (p *packetIO) writePacket(data []byte) error {
 
 		data[3] = p.sequence
 
-		if n, err := p.wb.Write(data[:4+mysql.MaxPayloadLen]); err != nil {
+		if n, err := p.bufWriter.Write(data[:4+mysql.MaxPayloadLen]); err != nil {
 			return mysql.ErrBadConn
 		} else if n != (4 + mysql.MaxPayloadLen) {
 			return mysql.ErrBadConn
@@ -126,7 +140,8 @@ func (p *packetIO) writePacket(data []byte) error {
 	data[2] = byte(length >> 16)
 	data[3] = p.sequence
 
-	if n, err := p.wb.Write(data); err != nil {
+	if n, err := p.bufWriter.Write(data); err != nil {
+		terror.Log(errors.Trace(err))
 		return errors.Trace(mysql.ErrBadConn)
 	} else if n != len(data) {
 		return errors.Trace(mysql.ErrBadConn)
@@ -137,5 +152,5 @@ func (p *packetIO) writePacket(data []byte) error {
 }
 
 func (p *packetIO) flush() error {
-	return p.wb.Flush()
+	return p.bufWriter.Flush()
 }

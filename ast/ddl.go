@@ -15,7 +15,7 @@ package ast
 
 import (
 	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/types"
 )
 
 var (
@@ -23,9 +23,11 @@ var (
 	_ DDLNode = &CreateDatabaseStmt{}
 	_ DDLNode = &CreateIndexStmt{}
 	_ DDLNode = &CreateTableStmt{}
+	_ DDLNode = &CreateViewStmt{}
 	_ DDLNode = &DropDatabaseStmt{}
 	_ DDLNode = &DropIndexStmt{}
 	_ DDLNode = &DropTableStmt{}
+	_ DDLNode = &RenameTableStmt{}
 	_ DDLNode = &TruncateTableStmt{}
 
 	_ Node = &AlterTableSpec{}
@@ -60,7 +62,7 @@ type DatabaseOption struct {
 }
 
 // CreateDatabaseStmt is a statement to create a database.
-// See: https://dev.mysql.com/doc/refman/5.7/en/create-database.html
+// See https://dev.mysql.com/doc/refman/5.7/en/create-database.html
 type CreateDatabaseStmt struct {
 	ddlNode
 
@@ -80,7 +82,7 @@ func (n *CreateDatabaseStmt) Accept(v Visitor) (Node, bool) {
 }
 
 // DropDatabaseStmt is a statement to drop a database and all tables in the database.
-// See: https://dev.mysql.com/doc/refman/5.7/en/drop-database.html
+// See https://dev.mysql.com/doc/refman/5.7/en/drop-database.html
 type DropDatabaseStmt struct {
 	ddlNode
 
@@ -122,7 +124,7 @@ func (n *IndexColName) Accept(v Visitor) (Node, bool) {
 }
 
 // ReferenceDef is used for parsing foreign key reference option from SQL.
-// See: http://dev.mysql.com/doc/refman/5.7/en/create-table-foreign-keys.html
+// See http://dev.mysql.com/doc/refman/5.7/en/create-table-foreign-keys.html
 type ReferenceDef struct {
 	node
 
@@ -233,15 +235,12 @@ const (
 	ColumnOptionNotNull
 	ColumnOptionAutoIncrement
 	ColumnOptionDefaultValue
-	ColumnOptionUniq
-	ColumnOptionIndex
-	ColumnOptionUniqIndex
-	ColumnOptionKey
 	ColumnOptionUniqKey
 	ColumnOptionNull
 	ColumnOptionOnUpdate // For Timestamp and Datetime only.
 	ColumnOptionFulltext
 	ColumnOptionComment
+	ColumnOptionGenerated
 )
 
 // ColumnOption is used for parsing column constraint info from SQL.
@@ -249,8 +248,11 @@ type ColumnOption struct {
 	node
 
 	Tp ColumnOptionType
-	// The value For Default or On Update.
+	// For ColumnOptionDefaultValue or ColumnOptionOnUpdate, it's the target value.
+	// For ColumnOptionGenerated, it's the target expression.
 	Expr ExprNode
+	// Stored is only for ColumnOptionGenerated, default is false.
+	Stored bool
 }
 
 // Accept implements Node Accept interface.
@@ -275,7 +277,7 @@ func (n *ColumnOption) Accept(v Visitor) (Node, bool) {
 //  | index_type
 //  | WITH PARSER parser_name
 //  | COMMENT 'string'
-// See: http://dev.mysql.com/doc/refman/5.7/en/create-table.html
+// See http://dev.mysql.com/doc/refman/5.7/en/create-table.html
 type IndexOption struct {
 	node
 
@@ -317,14 +319,11 @@ type Constraint struct {
 	Tp   ConstraintType
 	Name string
 
-	// Used for PRIMARY KEY, UNIQUE, ......
-	Keys []*IndexColName
+	Keys []*IndexColName // Used for PRIMARY KEY, UNIQUE, ......
 
-	// Used for foreign key.
-	Refer *ReferenceDef
+	Refer *ReferenceDef // Used for foreign key.
 
-	// Index Options
-	Option *IndexOption
+	Option *IndexOption // Index Options
 }
 
 // Accept implements Node Accept interface.
@@ -390,12 +389,13 @@ func (n *ColumnDef) Accept(v Visitor) (Node, bool) {
 }
 
 // CreateTableStmt is a statement to create a table.
-// See: https://dev.mysql.com/doc/refman/5.7/en/create-table.html
+// See https://dev.mysql.com/doc/refman/5.7/en/create-table.html
 type CreateTableStmt struct {
 	ddlNode
 
 	IfNotExists bool
 	Table       *TableName
+	ReferTable  *TableName
 	Cols        []*ColumnDef
 	Constraints []*Constraint
 	Options     []*TableOption
@@ -413,6 +413,13 @@ func (n *CreateTableStmt) Accept(v Visitor) (Node, bool) {
 		return n, false
 	}
 	n.Table = node.(*TableName)
+	if n.ReferTable != nil {
+		node, ok = n.ReferTable.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.ReferTable = node.(*TableName)
+	}
 	for i, val := range n.Cols {
 		node, ok = val.Accept(v)
 		if !ok {
@@ -431,7 +438,7 @@ func (n *CreateTableStmt) Accept(v Visitor) (Node, bool) {
 }
 
 // DropTableStmt is a statement to drop one or more tables.
-// See: https://dev.mysql.com/doc/refman/5.7/en/drop-table.html
+// See https://dev.mysql.com/doc/refman/5.7/en/drop-table.html
 type DropTableStmt struct {
 	ddlNode
 
@@ -456,8 +463,93 @@ func (n *DropTableStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+// RenameTableStmt is a statement to rename a table.
+// See http://dev.mysql.com/doc/refman/5.7/en/rename-table.html
+type RenameTableStmt struct {
+	ddlNode
+
+	OldTable *TableName
+	NewTable *TableName
+	// TODO: Refactor this when you are going to add full support for multiple schema changes.
+	// Currently it is only useful for syncer which depends heavily on tidb parser to do some dirty work.
+	TableToTables []*TableToTable
+}
+
+// Accept implements Node Accept interface.
+func (n *RenameTableStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*RenameTableStmt)
+	node, ok := n.OldTable.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.OldTable = node.(*TableName)
+	node, ok = n.NewTable.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.NewTable = node.(*TableName)
+
+	for i, t := range n.TableToTables {
+		node, ok := t.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.TableToTables[i] = node.(*TableToTable)
+	}
+
+	return v.Leave(n)
+}
+
+// TableToTable represents renaming old table to new table used in RenameTableStmt.
+type TableToTable struct {
+	node
+	OldTable *TableName
+	NewTable *TableName
+}
+
+// Accept implements Node Accept interface.
+func (n *TableToTable) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*TableToTable)
+	node, ok := n.OldTable.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.OldTable = node.(*TableName)
+	node, ok = n.NewTable.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.NewTable = node.(*TableName)
+	return v.Leave(n)
+}
+
+// CreateViewStmt is a statement to create a View.
+// See https://dev.mysql.com/doc/refman/5.7/en/create-view.html
+type CreateViewStmt struct {
+	ddlNode
+
+	OrReplace bool
+	ViewName  *TableName
+	Cols      []model.CIStr
+	Select    StmtNode
+}
+
+// Accept implements Node Accept interface.
+func (n *CreateViewStmt) Accept(v Visitor) (Node, bool) {
+	// TODO: implement the details.
+	return n, true
+}
+
 // CreateIndexStmt is a statement to create an index.
-// See: https://dev.mysql.com/doc/refman/5.7/en/create-index.html
+// See https://dev.mysql.com/doc/refman/5.7/en/create-index.html
 type CreateIndexStmt struct {
 	ddlNode
 
@@ -465,6 +557,7 @@ type CreateIndexStmt struct {
 	Table         *TableName
 	Unique        bool
 	IndexColNames []*IndexColName
+	IndexOption   *IndexOption
 }
 
 // Accept implements Node Accept interface.
@@ -486,11 +579,18 @@ func (n *CreateIndexStmt) Accept(v Visitor) (Node, bool) {
 		}
 		n.IndexColNames[i] = node.(*IndexColName)
 	}
+	if n.IndexOption != nil {
+		node, ok := n.IndexOption.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.IndexOption = node.(*IndexOption)
+	}
 	return v.Leave(n)
 }
 
 // DropIndexStmt is a statement to drop the index.
-// See: https://dev.mysql.com/doc/refman/5.7/en/drop-index.html
+// See https://dev.mysql.com/doc/refman/5.7/en/drop-index.html
 type DropIndexStmt struct {
 	ddlNode
 
@@ -535,6 +635,9 @@ const (
 	TableOptionMinRows
 	TableOptionDelayKeyWrite
 	TableOptionRowFormat
+	TableOptionStatsPersistent
+	TableOptionShardRowID
+	TableOptionPackKeys
 )
 
 // RowFormat types
@@ -567,7 +670,7 @@ const (
 // ColumnPosition represent the position of the newly added column
 type ColumnPosition struct {
 	node
-	// ColumnPositionNone | ColumnPositionFirst | ColumnPositionAfter
+	// Tp is either ColumnPositionNone, ColumnPositionFirst or ColumnPositionAfter.
 	Tp ColumnPositionType
 	// RelativeColumn is the column the newly added column after if type is ColumnPositionAfter
 	RelativeColumn *ColumnName
@@ -596,27 +699,46 @@ type AlterTableType int
 // AlterTable types.
 const (
 	AlterTableOption AlterTableType = iota + 1
-	AlterTableAddColumn
+	AlterTableAddColumns
 	AlterTableAddConstraint
 	AlterTableDropColumn
 	AlterTableDropPrimaryKey
 	AlterTableDropIndex
 	AlterTableDropForeignKey
+	AlterTableModifyColumn
+	AlterTableChangeColumn
+	AlterTableRenameTable
+	AlterTableAlterColumn
+	AlterTableLock
 
 // TODO: Add more actions
+)
+
+// LockType is the type for AlterTableSpec.
+// See https://dev.mysql.com/doc/refman/5.7/en/alter-table.html#alter-table-concurrency
+type LockType byte
+
+// Lock Types.
+const (
+	LockTypeNone LockType = iota + 1
+	LockTypeDefault
+	LockTypeShared
+	LockTypeExclusive
 )
 
 // AlterTableSpec represents alter table specification.
 type AlterTableSpec struct {
 	node
 
-	Tp         AlterTableType
-	Name       string
-	Constraint *Constraint
-	Options    []*TableOption
-	Column     *ColumnDef
-	DropColumn *ColumnName
-	Position   *ColumnPosition
+	Tp            AlterTableType
+	Name          string
+	Constraint    *Constraint
+	Options       []*TableOption
+	NewTable      *TableName
+	NewColumns    []*ColumnDef
+	OldColumnName *ColumnName
+	Position      *ColumnPosition
+	LockType      LockType
 }
 
 // Accept implements Node Accept interface.
@@ -633,19 +755,26 @@ func (n *AlterTableSpec) Accept(v Visitor) (Node, bool) {
 		}
 		n.Constraint = node.(*Constraint)
 	}
-	if n.Column != nil {
-		node, ok := n.Column.Accept(v)
+	if n.NewTable != nil {
+		node, ok := n.NewTable.Accept(v)
 		if !ok {
 			return n, false
 		}
-		n.Column = node.(*ColumnDef)
+		n.NewTable = node.(*TableName)
 	}
-	if n.DropColumn != nil {
-		node, ok := n.DropColumn.Accept(v)
+	for _, col := range n.NewColumns {
+		node, ok := col.Accept(v)
 		if !ok {
 			return n, false
 		}
-		n.DropColumn = node.(*ColumnName)
+		col = node.(*ColumnDef)
+	}
+	if n.OldColumnName != nil {
+		node, ok := n.OldColumnName.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.OldColumnName = node.(*ColumnName)
 	}
 	if n.Position != nil {
 		node, ok := n.Position.Accept(v)
@@ -658,7 +787,7 @@ func (n *AlterTableSpec) Accept(v Visitor) (Node, bool) {
 }
 
 // AlterTableStmt is a statement to change the structure of a table.
-// See: https://dev.mysql.com/doc/refman/5.7/en/alter-table.html
+// See https://dev.mysql.com/doc/refman/5.7/en/alter-table.html
 type AlterTableStmt struct {
 	ddlNode
 
@@ -689,7 +818,7 @@ func (n *AlterTableStmt) Accept(v Visitor) (Node, bool) {
 }
 
 // TruncateTableStmt is a statement to empty a table completely.
-// See: https://dev.mysql.com/doc/refman/5.7/en/truncate-table.html
+// See https://dev.mysql.com/doc/refman/5.7/en/truncate-table.html
 type TruncateTableStmt struct {
 	ddlNode
 

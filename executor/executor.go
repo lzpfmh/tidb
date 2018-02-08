@@ -14,250 +14,939 @@
 package executor
 
 import (
-	"sort"
+	"fmt"
+	"sync"
+	"sync/atomic"
 
+	"github.com/cznic/mathutil"
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/column"
 	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/evaluator"
-	"github.com/pingcap/tidb/inspectkv"
+	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/optimizer/plan"
-	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/sessionctx/db"
-	"github.com/pingcap/tidb/sessionctx/forupdate"
+	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/plan"
 	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util/codec"
-	"github.com/pingcap/tidb/util/distinct"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/admin"
+	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/ranger"
+	goctx "golang.org/x/net/context"
 )
 
 var (
-	_ Executor = &AggregateExec{}
 	_ Executor = &CheckTableExec{}
-	_ Executor = &FilterExec{}
-	_ Executor = &IndexRangeExec{}
-	_ Executor = &IndexScanExec{}
+	_ Executor = &ExistsExec{}
+	_ Executor = &HashAggExec{}
 	_ Executor = &LimitExec{}
-	_ Executor = &SelectFieldsExec{}
+	_ Executor = &MaxOneRowExec{}
+	_ Executor = &ProjectionExec{}
+	_ Executor = &SelectionExec{}
 	_ Executor = &SelectLockExec{}
 	_ Executor = &ShowDDLExec{}
+	_ Executor = &ShowDDLJobsExec{}
 	_ Executor = &SortExec{}
+	_ Executor = &StreamAggExec{}
 	_ Executor = &TableDualExec{}
 	_ Executor = &TableScanExec{}
+	_ Executor = &TopNExec{}
+	_ Executor = &UnionExec{}
 )
 
 // Error instances.
 var (
-	ErrUnknownPlan     = terror.ClassExecutor.New(CodeUnknownPlan, "Unknown plan")
-	ErrPrepareMulti    = terror.ClassExecutor.New(CodePrepareMulti, "Can not prepare multiple statements")
-	ErrStmtNotFound    = terror.ClassExecutor.New(CodeStmtNotFound, "Prepared statement not found")
-	ErrSchemaChanged   = terror.ClassExecutor.New(CodeSchemaChanged, "Schema has changed")
-	ErrWrongParamCount = terror.ClassExecutor.New(CodeWrongParamCount, "Wrong parameter count")
+	ErrUnknownPlan          = terror.ClassExecutor.New(codeUnknownPlan, "Unknown plan")
+	ErrPrepareMulti         = terror.ClassExecutor.New(codePrepareMulti, "Can not prepare multiple statements")
+	ErrPrepareDDL           = terror.ClassExecutor.New(codePrepareDDL, "Can not prepare DDL statements")
+	ErrPasswordNoMatch      = terror.ClassExecutor.New(CodePasswordNoMatch, "Can't find any matching row in the user table")
+	ErrResultIsEmpty        = terror.ClassExecutor.New(codeResultIsEmpty, "result is empty")
+	ErrBuildExecutor        = terror.ClassExecutor.New(codeErrBuildExec, "Failed to build executor")
+	ErrBatchInsertFail      = terror.ClassExecutor.New(codeBatchInsertFail, "Batch insert failed, please clean the table and try again.")
+	ErrWrongValueCountOnRow = terror.ClassExecutor.New(codeWrongValueCountOnRow, "Column count doesn't match value count at row %d")
+	ErrPasswordFormat       = terror.ClassExecutor.New(codePasswordFormat, "The password hash doesn't have the expected format. Check if the correct password algorithm is being used with the PASSWORD() function.")
+	ErrMemExceedThreshold   = terror.ClassExecutor.New(codeMemExceedThreshold, mysql.MySQLErrName[mysql.ErrMemExceedThreshold])
 )
 
 // Error codes.
 const (
-	CodeUnknownPlan     terror.ErrCode = 1
-	CodePrepareMulti    terror.ErrCode = 2
-	CodeStmtNotFound    terror.ErrCode = 3
-	CodeSchemaChanged   terror.ErrCode = 4
-	CodeWrongParamCount terror.ErrCode = 5
+	codeUnknownPlan          terror.ErrCode = 1
+	codePrepareMulti         terror.ErrCode = 2
+	codePrepareDDL           terror.ErrCode = 7
+	codeResultIsEmpty        terror.ErrCode = 8
+	codeErrBuildExec         terror.ErrCode = 9
+	codeBatchInsertFail      terror.ErrCode = 10
+	CodePasswordNoMatch      terror.ErrCode = 1133 // MySQL error code
+	CodeCannotUser           terror.ErrCode = 1396 // MySQL error code
+	codeWrongValueCountOnRow terror.ErrCode = 1136 // MySQL error code
+	codePasswordFormat       terror.ErrCode = 1827 // MySQL error code
+	codeMemExceedThreshold   terror.ErrCode = 8001
 )
 
-// Row represents a record row.
-type Row struct {
-	// Data is the output record data for current Plan.
-	Data []types.Datum
+// Row represents a result set row, it may be returned from a table, a join, or a projection.
+//
+// The following cases will need store the handle information:
+//
+// If the top plan is update or delete, then every executor will need the handle.
+// If there is an union scan, then the below scan plan must store the handle.
+// If there is sort need in the double read, then the table scan of the double read must store the handle.
+// If there is a select for update. then we need to store the handle until the lock plan. But if there is aggregation, the handle info can be removed.
+// Otherwise the executor's returned rows don't need to store the handle information.
+type Row = types.DatumRow
 
-	RowKeys []*RowKeyEntry
+type baseExecutor struct {
+	ctx             context.Context
+	schema          *expression.Schema
+	supportChk      bool
+	maxChunkSize    int
+	children        []Executor
+	childrenResults []*chunk.Chunk
+	retFieldTypes   []*types.FieldType
 }
 
-// RowKeyEntry is designed for Delete statement in multi-table mode,
-// we should know which table this row comes from.
-type RowKeyEntry struct {
-	// The table which this row come from.
-	Tbl table.Table
-	// Row key.
-	Handle int64
-	// Table alias name.
-	TableAsName *model.CIStr
+// Open implements the Executor Open interface.
+func (e *baseExecutor) Open(goCtx goctx.Context) error {
+	for _, child := range e.children {
+		err := child.Open(goCtx)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	e.childrenResults = make([]*chunk.Chunk, 0, len(e.children))
+	for _, child := range e.children {
+		e.childrenResults = append(e.childrenResults, child.newChunk())
+	}
+	return nil
+}
+
+// Close implements the Executor Close interface.
+func (e *baseExecutor) Close() error {
+	for _, child := range e.children {
+		err := child.Close()
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	e.childrenResults = nil
+	return nil
+}
+
+// Schema implements the Executor Schema interface.
+func (e *baseExecutor) Schema() *expression.Schema {
+	if e.schema == nil {
+		return expression.NewSchema()
+	}
+	return e.schema
+}
+
+func (e *baseExecutor) newChunk() *chunk.Chunk {
+	return chunk.NewChunk(e.retTypes())
+}
+
+// retTypes implements the Executor retTypes interface.
+func (e *baseExecutor) retTypes() []*types.FieldType {
+	return e.retFieldTypes
+}
+
+func (e *baseExecutor) supportChunk() bool {
+	if !e.supportChk {
+		return false
+	}
+	for _, child := range e.children {
+		if !child.supportChunk() {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *baseExecutor) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	return nil
+}
+
+func newBaseExecutor(schema *expression.Schema, ctx context.Context, children ...Executor) baseExecutor {
+	e := baseExecutor{
+		children:     children,
+		ctx:          ctx,
+		schema:       schema,
+		maxChunkSize: ctx.GetSessionVars().MaxChunkSize,
+	}
+	if schema != nil {
+		cols := schema.Columns
+		e.retFieldTypes = make([]*types.FieldType, len(cols))
+		for i := range cols {
+			e.retFieldTypes[i] = cols[i].RetType
+		}
+	}
+	return e
 }
 
 // Executor executes a query.
 type Executor interface {
-	Fields() []*ast.ResultField
-	Next() (*Row, error)
+	Next(goctx.Context) (Row, error)
 	Close() error
+	Open(goctx.Context) error
+	Schema() *expression.Schema
+	retTypes() []*types.FieldType
+	supportChunk() bool
+	newChunk() *chunk.Chunk
+	NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error
+}
+
+// CancelDDLJobsExec represents a cancel DDL jobs executor.
+type CancelDDLJobsExec struct {
+	baseExecutor
+
+	cursor int
+	jobIDs []int64
+	errs   []error
+}
+
+// Next implements the Executor Next interface.
+func (e *CancelDDLJobsExec) Next(goCtx goctx.Context) (Row, error) {
+	var row Row
+	if e.cursor < len(e.jobIDs) {
+		ret := "successful"
+		if e.errs[e.cursor] != nil {
+			ret = fmt.Sprintf("error: %v", e.errs[e.cursor])
+		}
+		row = types.MakeDatums(e.jobIDs[e.cursor], ret)
+		e.cursor++
+	}
+
+	return row, nil
+}
+
+// NextChunk implements the Executor NextChunk interface.
+func (e *CancelDDLJobsExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+	if e.cursor >= len(e.jobIDs) {
+		return nil
+	}
+	numCurBatch := mathutil.Min(e.maxChunkSize, len(e.jobIDs)-e.cursor)
+	for i := e.cursor; i < e.cursor+numCurBatch; i++ {
+		chk.AppendInt64(0, e.jobIDs[i])
+		if e.errs[i] != nil {
+			chk.AppendString(1, fmt.Sprintf("error: %v", e.errs[i]))
+		} else {
+			chk.AppendString(1, "successful")
+		}
+	}
+	e.cursor += numCurBatch
+	return nil
 }
 
 // ShowDDLExec represents a show DDL executor.
 type ShowDDLExec struct {
-	fields []*ast.ResultField
-	ctx    context.Context
-	done   bool
+	baseExecutor
+
+	ddlOwnerID string
+	selfID     string
+	ddlInfo    *admin.DDLInfo
+	done       bool
 }
 
-// Fields implements Executor Fields interface.
-func (e *ShowDDLExec) Fields() []*ast.ResultField {
-	return e.fields
-}
-
-// Next implements Executor Next interface.
-func (e *ShowDDLExec) Next() (*Row, error) {
+// Next implements the Executor Next interface.
+func (e *ShowDDLExec) Next(goCtx goctx.Context) (Row, error) {
 	if e.done {
 		return nil, nil
 	}
 
-	txn, err := e.ctx.GetTxn(false)
-	if err != nil {
-		return nil, errors.Trace(err)
+	var ddlJob string
+	if e.ddlInfo.Job != nil {
+		ddlJob = e.ddlInfo.Job.String()
 	}
 
-	ddlInfo, err := inspectkv.GetDDLInfo(txn)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	bgInfo, err := inspectkv.GetBgDDLInfo(txn)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-
-	var ddlOwner, ddlJob string
-	if ddlInfo.Owner != nil {
-		ddlOwner = ddlInfo.Owner.String()
-	}
-	if ddlInfo.Job != nil {
-		ddlJob = ddlInfo.Job.String()
-	}
-
-	var bgOwner, bgJob string
-	if bgInfo.Owner != nil {
-		bgOwner = bgInfo.Owner.String()
-	}
-	if bgInfo.Job != nil {
-		bgJob = bgInfo.Job.String()
-	}
-
-	row := &Row{}
-	row.Data = types.MakeDatums(
-		ddlInfo.SchemaVer,
-		ddlOwner,
+	row := types.MakeDatums(
+		e.ddlInfo.SchemaVer,
+		e.ddlOwnerID,
 		ddlJob,
-		bgInfo.SchemaVer,
-		bgOwner,
-		bgJob,
+		e.selfID,
 	)
-	for i, f := range e.fields {
-		f.Expr.SetValue(row.Data[i].GetValue())
-	}
 	e.done = true
 
 	return row, nil
 }
 
-// Close implements Executor Close interface.
-func (e *ShowDDLExec) Close() error {
+// NextChunk implements the Executor NextChunk interface.
+func (e *ShowDDLExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+	if e.done {
+		return nil
+	}
+
+	ddlJob := ""
+	if e.ddlInfo.Job != nil {
+		ddlJob = e.ddlInfo.Job.String()
+	}
+	chk.AppendInt64(0, e.ddlInfo.SchemaVer)
+	chk.AppendString(1, e.ddlOwnerID)
+	chk.AppendString(2, ddlJob)
+	chk.AppendString(3, e.selfID)
+	e.done = true
+	return nil
+}
+
+// ShowDDLJobsExec represent a show DDL jobs executor.
+type ShowDDLJobsExec struct {
+	baseExecutor
+
+	cursor int
+	jobs   []*model.Job
+}
+
+// Open implements the Executor Open interface.
+func (e *ShowDDLJobsExec) Open(goCtx goctx.Context) error {
+	if err := e.baseExecutor.Open(goCtx); err != nil {
+		return errors.Trace(err)
+	}
+	jobs, err := admin.GetDDLJobs(e.ctx.Txn())
+	if err != nil {
+		return errors.Trace(err)
+	}
+	historyJobs, err := admin.GetHistoryDDLJobs(e.ctx.Txn())
+	if err != nil {
+		return errors.Trace(err)
+	}
+	e.jobs = append(e.jobs, jobs...)
+	e.jobs = append(e.jobs, historyJobs...)
+	e.cursor = 0
+	return nil
+}
+
+// Next implements the Executor Next interface.
+func (e *ShowDDLJobsExec) Next(goCtx goctx.Context) (Row, error) {
+	if e.cursor >= len(e.jobs) {
+		return nil, nil
+	}
+
+	job := e.jobs[e.cursor]
+	row := types.MakeDatums(job.String(), job.State.String())
+	e.cursor++
+
+	return row, nil
+}
+
+// NextChunk implements the Executor NextChunk interface.
+func (e *ShowDDLJobsExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+	if e.cursor >= len(e.jobs) {
+		return nil
+	}
+	numCurBatch := mathutil.Min(e.maxChunkSize, len(e.jobs)-e.cursor)
+	for i := e.cursor; i < e.cursor+numCurBatch; i++ {
+		chk.AppendString(0, e.jobs[i].String())
+		chk.AppendString(1, e.jobs[i].State.String())
+	}
+	e.cursor += numCurBatch
 	return nil
 }
 
 // CheckTableExec represents a check table executor.
+// It is built from the "admin check table" statement, and it checks if the
+// index matches the records in the table.
 type CheckTableExec struct {
+	baseExecutor
+
 	tables []*ast.TableName
-	ctx    context.Context
 	done   bool
+	is     infoschema.InfoSchema
 }
 
-// Fields implements Executor Fields interface.
-func (e *CheckTableExec) Fields() []*ast.ResultField {
+// Open implements the Executor Open interface.
+func (e *CheckTableExec) Open(goCtx goctx.Context) error {
+	if err := e.baseExecutor.Open(goCtx); err != nil {
+		return errors.Trace(err)
+	}
+	e.done = false
 	return nil
 }
 
-// Next implements Executor Next interface.
-func (e *CheckTableExec) Next() (*Row, error) {
+// Next implements the Executor Next interface.
+func (e *CheckTableExec) Next(goCtx goctx.Context) (Row, error) {
 	if e.done {
 		return nil, nil
 	}
+	err := e.run(goCtx)
+	e.done = true
+	return nil, errors.Trace(err)
+}
 
-	dbName := model.NewCIStr(db.GetCurrentSchema(e.ctx))
-	is := sessionctx.GetDomain(e.ctx).InfoSchema()
+// NextChunk implements the Executor NextChunk interface.
+func (e *CheckTableExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	if e.done {
+		return nil
+	}
+	err := e.run(goCtx)
+	e.done = true
+	return errors.Trace(err)
+}
 
+func (e *CheckTableExec) run(goCtx goctx.Context) error {
+	dbName := model.NewCIStr(e.ctx.GetSessionVars().CurrentDB)
 	for _, t := range e.tables {
-		tb, err := is.TableByName(dbName, t.Name)
+		tb, err := e.is.TableByName(dbName, t.Name)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return errors.Trace(err)
 		}
 		for _, idx := range tb.Indices() {
-			txn, err := e.ctx.GetTxn(false)
+			txn := e.ctx.Txn()
+			err = admin.CompareIndexData(e.ctx.GetSessionVars().StmtCtx, txn, tb, idx)
 			if err != nil {
-				return nil, errors.Trace(err)
-			}
-			err = inspectkv.CompareIndexData(txn, tb, idx)
-			if err != nil {
-				return nil, errors.Errorf("%v err:%v", t.Name, err)
+				return errors.Errorf("%v err:%v", t.Name, err)
 			}
 		}
 	}
-	e.done = true
-
-	return nil, nil
+	return nil
 }
 
-// Close implements plan.Plan Close interface.
-func (e *CheckTableExec) Close() error {
+// SelectLockExec represents a select lock executor.
+// It is built from the "SELECT .. FOR UPDATE" or the "SELECT .. LOCK IN SHARE MODE" statement.
+// For "SELECT .. FOR UPDATE" statement, it locks every row key from source Executor.
+// After the execution, the keys are buffered in transaction, and will be sent to KV
+// when doing commit. If there is any key already locked by another transaction,
+// the transaction will rollback and retry.
+type SelectLockExec struct {
+	baseExecutor
+
+	Lock ast.SelectLockType
+}
+
+// Next implements the Executor Next interface.
+func (e *SelectLockExec) Next(goCtx goctx.Context) (Row, error) {
+	row, err := e.children[0].Next(goCtx)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if row == nil {
+		return nil, nil
+	}
+	// If there's no handle or it isn't a `select for update`.
+	if len(e.Schema().TblID2Handle) == 0 || e.Lock != ast.SelectLockForUpdate {
+		return row, nil
+	}
+	txn := e.ctx.Txn()
+	txnCtx := e.ctx.GetSessionVars().TxnCtx
+	txnCtx.ForUpdate = true
+	for id, cols := range e.Schema().TblID2Handle {
+		for _, col := range cols {
+			handle := row[col.Index].GetInt64()
+			lockKey := tablecodec.EncodeRowKeyWithHandle(id, handle)
+			err = txn.LockKeys(lockKey)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			// This operation is only for schema validator check.
+			txnCtx.UpdateDeltaForTable(id, 0, 0)
+		}
+	}
+	return row, nil
+}
+
+// NextChunk implements the Executor NextChunk interface.
+func (e *SelectLockExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+	err := e.children[0].NextChunk(goCtx, chk)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	// If there's no handle or it's not a `SELECT FOR UPDATE` statement.
+	if len(e.Schema().TblID2Handle) == 0 || e.Lock != ast.SelectLockForUpdate {
+		return nil
+	}
+	txn := e.ctx.Txn()
+	txnCtx := e.ctx.GetSessionVars().TxnCtx
+	txnCtx.ForUpdate = true
+	keys := make([]kv.Key, 0, chk.NumRows())
+	iter := chunk.NewIterator4Chunk(chk)
+	for id, cols := range e.Schema().TblID2Handle {
+		for _, col := range cols {
+			keys = keys[:0]
+			for row := iter.Begin(); row != iter.End(); row = iter.Next() {
+				keys = append(keys, tablecodec.EncodeRowKeyWithHandle(id, row.GetInt64(col.Index)))
+			}
+			err = txn.LockKeys(keys...)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			// This operation is only for schema validator check.
+			txnCtx.UpdateDeltaForTable(id, 0, 0)
+		}
+	}
 	return nil
+}
+
+// LimitExec represents limit executor
+// It ignores 'Offset' rows from src, then returns 'Count' rows at maximum.
+type LimitExec struct {
+	baseExecutor
+
+	begin  uint64
+	end    uint64
+	cursor uint64
+
+	// meetFirstBatch represents whether we have met the first valid Chunk from child.
+	meetFirstBatch bool
+}
+
+// Next implements the Executor Next interface.
+func (e *LimitExec) Next(goCtx goctx.Context) (Row, error) {
+	for e.cursor < e.begin {
+		srcRow, err := e.children[0].Next(goCtx)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if srcRow == nil {
+			return nil, nil
+		}
+		e.cursor++
+	}
+	if e.cursor >= e.end {
+		return nil, nil
+	}
+	srcRow, err := e.children[0].Next(goCtx)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if srcRow == nil {
+		return nil, nil
+	}
+	e.cursor++
+	return srcRow, nil
+}
+
+// NextChunk implements the Executor NextChunk interface.
+func (e *LimitExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+	if e.cursor >= e.end {
+		return nil
+	}
+	for !e.meetFirstBatch {
+		err := e.children[0].NextChunk(goCtx, e.childrenResults[0])
+		if err != nil {
+			return errors.Trace(err)
+		}
+		batchSize := uint64(e.childrenResults[0].NumRows())
+		// no more data.
+		if batchSize == 0 {
+			return nil
+		}
+		if newCursor := e.cursor + batchSize; newCursor >= e.begin {
+			e.meetFirstBatch = true
+			begin, end := e.begin-e.cursor, batchSize
+			if newCursor > e.end {
+				end = e.end - e.cursor
+			}
+			chk.Append(e.childrenResults[0], int(begin), int(end))
+			e.cursor += end
+			return nil
+		}
+		e.cursor += batchSize
+	}
+	err := e.children[0].NextChunk(goCtx, chk)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	batchSize := uint64(chk.NumRows())
+	// no more data.
+	if batchSize == 0 {
+		return nil
+	}
+	if e.cursor+batchSize > e.end {
+		chk.TruncateTo(int(e.end - e.cursor))
+		batchSize = e.end - e.cursor
+	}
+	e.cursor += batchSize
+	return nil
+}
+
+// Open implements the Executor Open interface.
+func (e *LimitExec) Open(goCtx goctx.Context) error {
+	if err := e.baseExecutor.Open(goCtx); err != nil {
+		return errors.Trace(err)
+	}
+	e.cursor = 0
+	e.meetFirstBatch = e.begin == 0
+	return nil
+}
+
+func init() {
+	// While doing optimization in the plan package, we need to execute uncorrelated subquery,
+	// but the plan package cannot import the executor package because of the dependency cycle.
+	// So we assign a function implemented in the executor package to the plan package to avoid the dependency cycle.
+	plan.EvalSubquery = func(p plan.PhysicalPlan, is infoschema.InfoSchema, ctx context.Context) (rows [][]types.Datum, err error) {
+		err = ctx.ActivePendingTxn()
+		if err != nil {
+			return rows, errors.Trace(err)
+		}
+		e := &executorBuilder{is: is, ctx: ctx}
+		exec := e.build(p)
+		if e.err != nil {
+			return rows, errors.Trace(err)
+		}
+		goCtx := goctx.TODO()
+		err = exec.Open(goCtx)
+		defer terror.Call(exec.Close)
+		if err != nil {
+			return rows, errors.Trace(err)
+		}
+		if ctx.GetSessionVars().EnableChunk {
+			for {
+				chk := exec.newChunk()
+				err = exec.NextChunk(goCtx, chk)
+				if err != nil {
+					return rows, errors.Trace(err)
+				}
+				if chk.NumRows() == 0 {
+					return rows, nil
+				}
+				iter := chunk.NewIterator4Chunk(chk)
+				for r := iter.Begin(); r != iter.End(); r = iter.Next() {
+					row := r.GetDatumRow(exec.retTypes())
+					rows = append(rows, row)
+				}
+			}
+		}
+		for {
+			row, err := exec.Next(goCtx)
+			if err != nil {
+				return rows, errors.Trace(err)
+			}
+			if row == nil {
+				return rows, nil
+			}
+			rows = append(rows, row)
+		}
+	}
+	tableMySQLErrCodes := map[terror.ErrCode]uint16{
+		CodeCannotUser:           mysql.ErrCannotUser,
+		CodePasswordNoMatch:      mysql.ErrPasswordNoMatch,
+		codeWrongValueCountOnRow: mysql.ErrWrongValueCountOnRow,
+		codePasswordFormat:       mysql.ErrPasswordFormat,
+	}
+	terror.ErrClassToMySQLCodes[terror.ClassExecutor] = tableMySQLErrCodes
+}
+
+// ProjectionExec represents a select fields executor.
+type ProjectionExec struct {
+	baseExecutor
+
+	exprs            []expression.Expression // Only used in Next().
+	evaluatorSuit    *expression.EvaluatorSuit
+	calculateNoDelay bool
+}
+
+// Open implements the Executor Open interface.
+func (e *ProjectionExec) Open(goCtx goctx.Context) error {
+	if err := e.baseExecutor.Open(goCtx); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+// Next implements the Executor Next interface.
+func (e *ProjectionExec) Next(goCtx goctx.Context) (retRow Row, err error) {
+	srcRow, err := e.children[0].Next(goCtx)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if srcRow == nil {
+		return nil, nil
+	}
+	row := make([]types.Datum, 0, len(e.exprs))
+	for _, expr := range e.exprs {
+		val, err := expr.Eval(srcRow)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		row = append(row, val)
+	}
+	return row, nil
+}
+
+// NextChunk implements the Executor NextChunk interface.
+func (e *ProjectionExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+	if err := e.children[0].NextChunk(goCtx, e.childrenResults[0]); err != nil {
+		return errors.Trace(err)
+	}
+	return errors.Trace(e.evaluatorSuit.Run(e.ctx, e.childrenResults[0], chk))
 }
 
 // TableDualExec represents a dual table executor.
 type TableDualExec struct {
-	fields   []*ast.ResultField
-	executed bool
+	baseExecutor
+
+	// numDualRows can only be 0 or 1.
+	numDualRows int
+	numReturned int
 }
 
-// Fields implements Executor Fields interface.
-func (e *TableDualExec) Fields() []*ast.ResultField {
-	return e.fields
-}
-
-// Next implements Executor Next interface.
-func (e *TableDualExec) Next() (*Row, error) {
-	if e.executed {
-		return nil, nil
-	}
-	e.executed = true
-	return &Row{}, nil
-}
-
-// Close implements plan.Plan Close interface.
-func (e *TableDualExec) Close() error {
+// Open implements the Executor Open interface.
+func (e *TableDualExec) Open(goCtx goctx.Context) error {
+	e.numReturned = 0
 	return nil
 }
 
-// TableScanExec represents a table scan executor.
+// Next implements the Executor Next interface.
+func (e *TableDualExec) Next(goCtx goctx.Context) (Row, error) {
+	if e.numReturned >= e.numDualRows {
+		return nil, nil
+	}
+	e.numReturned = e.numDualRows
+	return Row{}, nil
+}
+
+// NextChunk implements the Executor NextChunk interface.
+func (e *TableDualExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+	if e.numReturned >= e.numDualRows {
+		return nil
+	}
+	if e.Schema().Len() == 0 {
+		chk.SetNumVirtualRows(1)
+	} else {
+		for i := range e.Schema().Columns {
+			chk.AppendNull(i)
+		}
+	}
+	e.numReturned = e.numDualRows
+	return nil
+}
+
+// SelectionExec represents a filter executor.
+type SelectionExec struct {
+	baseExecutor
+
+	batched   bool
+	filters   []expression.Expression
+	selected  []bool
+	inputIter *chunk.Iterator4Chunk
+	inputRow  chunk.Row
+}
+
+// Open implements the Executor Open interface.
+func (e *SelectionExec) Open(goCtx goctx.Context) error {
+	if err := e.baseExecutor.Open(goCtx); err != nil {
+		return errors.Trace(err)
+	}
+	e.batched = expression.Vectorizable(e.filters)
+	if e.batched {
+		e.selected = make([]bool, 0, chunk.InitialCapacity)
+	}
+	e.inputIter = chunk.NewIterator4Chunk(e.childrenResults[0])
+	e.inputRow = e.inputIter.End()
+	return nil
+}
+
+// Close implements plan.Plan Close interface.
+func (e *SelectionExec) Close() error {
+	if err := e.baseExecutor.Close(); err != nil {
+		return errors.Trace(err)
+	}
+	e.selected = nil
+	return nil
+}
+
+// Next implements the Executor Next interface.
+func (e *SelectionExec) Next(goCtx goctx.Context) (Row, error) {
+	for {
+		srcRow, err := e.children[0].Next(goCtx)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if srcRow == nil {
+			return nil, nil
+		}
+		match, err := expression.EvalBool(e.filters, srcRow, e.ctx)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if match {
+			return srcRow, nil
+		}
+	}
+}
+
+// NextChunk implements the Executor NextChunk interface.
+func (e *SelectionExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+
+	if !e.batched {
+		return errors.Trace(e.unBatchedNextChunk(goCtx, chk))
+	}
+
+	for {
+		for ; e.inputRow != e.inputIter.End(); e.inputRow = e.inputIter.Next() {
+			if !e.selected[e.inputRow.Idx()] {
+				continue
+			}
+			if chk.NumRows() == e.maxChunkSize {
+				return nil
+			}
+			chk.AppendRow(e.inputRow)
+		}
+		err := e.children[0].NextChunk(goCtx, e.childrenResults[0])
+		if err != nil {
+			return errors.Trace(err)
+		}
+		// no more data.
+		if e.childrenResults[0].NumRows() == 0 {
+			return nil
+		}
+		e.selected, err = expression.VectorizedFilter(e.ctx, e.filters, e.inputIter, e.selected)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		e.inputRow = e.inputIter.Begin()
+	}
+}
+
+// unBatchedNextChunk filters input rows one by one and returns once an input row is selected.
+// For sql with "SETVAR" in filter and "GETVAR" in projection, for example: "SELECT @a FROM t WHERE (@a := 2) > 0",
+// we have to set batch size to 1 to do the evaluation of filter and projection.
+func (e *SelectionExec) unBatchedNextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	for {
+		for ; e.inputRow != e.inputIter.End(); e.inputRow = e.inputIter.Next() {
+			selected, err := expression.EvalBool(e.filters, e.inputRow, e.ctx)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			if selected {
+				chk.AppendRow(e.inputRow)
+				e.inputRow = e.inputIter.Next()
+				return nil
+			}
+		}
+		err := e.children[0].NextChunk(goCtx, e.childrenResults[0])
+		if err != nil {
+			return errors.Trace(err)
+		}
+		e.inputRow = e.inputIter.Begin()
+		// no more data.
+		if e.childrenResults[0].NumRows() == 0 {
+			return nil
+		}
+	}
+}
+
+// TableScanExec is a table scan executor without result fields.
 type TableScanExec struct {
-	t           table.Table
-	tableAsName *model.CIStr
-	fields      []*ast.ResultField
-	iter        kv.Iterator
-	ctx         context.Context
-	ranges      []plan.TableRange // Disjoint close handle ranges.
-	seekHandle  int64             // The handle to seek, should be initialized to math.MinInt64.
-	cursor      int               // The range cursor, used to locate to current range.
+	baseExecutor
+
+	t          table.Table
+	asName     *model.CIStr
+	ranges     []ranger.IntColumnRange
+	seekHandle int64
+	iter       kv.Iterator
+	cursor     int
+	columns    []*model.ColumnInfo
+
+	isVirtualTable     bool
+	virtualTableRows   [][]types.Datum
+	virtualTableCursor int
+
+	// for chunk execution
+	virtualTableChunkList *chunk.List
+	virtualTableChunkIdx  int
 }
 
-// Fields implements Executor Fields interface.
-func (e *TableScanExec) Fields() []*ast.ResultField {
-	return e.fields
+// Next implements the Executor interface.
+func (e *TableScanExec) Next(goCtx goctx.Context) (Row, error) {
+	if e.isVirtualTable {
+		return e.nextForInfoSchema()
+	}
+	handle, found, err := e.nextHandle()
+	if err != nil || !found {
+		return nil, errors.Trace(err)
+	}
+	row, err := e.getRow(handle)
+	e.seekHandle = handle + 1
+	return row, errors.Trace(err)
 }
 
-// Next implements Executor Next interface.
-func (e *TableScanExec) Next() (*Row, error) {
+func (e *TableScanExec) nextForInfoSchema() (Row, error) {
+	if e.virtualTableRows == nil {
+		columns := make([]*table.Column, e.schema.Len())
+		for i, v := range e.columns {
+			columns[i] = table.ToColumn(v)
+		}
+		err := e.t.IterRecords(e.ctx, nil, columns, func(h int64, rec []types.Datum, cols []*table.Column) (bool, error) {
+			e.virtualTableRows = append(e.virtualTableRows, rec)
+			return true, nil
+		})
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	}
+	if e.virtualTableCursor >= len(e.virtualTableRows) {
+		return nil, nil
+	}
+	row := e.virtualTableRows[e.virtualTableCursor]
+	e.virtualTableCursor++
+	return row, nil
+}
+
+// NextChunk implements the Executor NextChunk interface.
+func (e *TableScanExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+	if e.isVirtualTable {
+		return errors.Trace(e.nextChunk4InfoSchema(goCtx, chk))
+	}
+	handle, found, err := e.nextHandle()
+	if err != nil || !found {
+		return errors.Trace(err)
+	}
+
+	mutableRow := chunk.MutRowFromTypes(e.retTypes())
+	for chk.NumRows() < e.maxChunkSize {
+		row, err := e.getRow(handle)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		e.seekHandle = handle + 1
+		mutableRow.SetDatums(row...)
+		chk.AppendRow(mutableRow.ToRow())
+	}
+	return nil
+}
+
+func (e *TableScanExec) nextChunk4InfoSchema(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+	if e.virtualTableChunkList == nil {
+		e.virtualTableChunkList = chunk.NewList(e.retTypes(), e.maxChunkSize)
+		columns := make([]*table.Column, e.schema.Len())
+		for i, colInfo := range e.columns {
+			columns[i] = table.ToColumn(colInfo)
+		}
+		mutableRow := chunk.MutRowFromTypes(e.retTypes())
+		err := e.t.IterRecords(e.ctx, nil, columns, func(h int64, rec []types.Datum, cols []*table.Column) (bool, error) {
+			mutableRow.SetDatums(rec...)
+			e.virtualTableChunkList.AppendRow(mutableRow.ToRow())
+			return true, nil
+		})
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	// no more data.
+	if e.virtualTableChunkIdx >= e.virtualTableChunkList.NumChunks() {
+		return nil
+	}
+	virtualTableChunk := e.virtualTableChunkList.GetChunk(e.virtualTableChunkIdx)
+	e.virtualTableChunkIdx++
+	chk.SwapColumns(virtualTableChunk)
+	return nil
+}
+
+// nextHandle gets the unique handle for next row.
+func (e *TableScanExec) nextHandle() (handle int64, found bool, err error) {
 	for {
 		if e.cursor >= len(e.ranges) {
-			return nil, nil
+			return 0, false, nil
 		}
 		ran := e.ranges[e.cursor]
 		if e.seekHandle < ran.LowVal {
@@ -267,12 +956,9 @@ func (e *TableScanExec) Next() (*Row, error) {
 			e.cursor++
 			continue
 		}
-		handle, found, err := e.t.Seek(e.ctx, e.seekHandle)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if !found {
-			return nil, nil
+		handle, found, err = e.t.Seek(e.ctx, e.seekHandle)
+		if err != nil || !found {
+			return 0, false, errors.Trace(err)
 		}
 		if handle > ran.HighVal {
 			// The handle is out of the current range, but may be in following ranges.
@@ -285,12 +971,7 @@ func (e *TableScanExec) Next() (*Row, error) {
 				continue
 			}
 		}
-		row, err := e.getRow(handle)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		e.seekHandle = handle + 1
-		return row, nil
+		return handle, true, nil
 	}
 }
 
@@ -313,959 +994,347 @@ func (e *TableScanExec) seekRange(handle int64) (inRange bool) {
 	}
 }
 
-func (e *TableScanExec) getRow(handle int64) (*Row, error) {
-	row := &Row{}
-	var err error
-
-	columns := make([]*column.Col, len(e.fields))
-	for i, v := range e.fields {
-		if v.Referenced {
-			columns[i] = e.t.Cols()[i]
-		}
+func (e *TableScanExec) getRow(handle int64) (Row, error) {
+	columns := make([]*table.Column, e.schema.Len())
+	for i, v := range e.columns {
+		columns[i] = table.ToColumn(v)
 	}
-	row.Data, err = e.t.RowWithCols(e.ctx, handle, columns)
+	row, err := e.t.RowWithCols(e.ctx, handle, columns)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	// Set result fields value.
-	for i, v := range e.fields {
-		if v.Referenced {
-			v.Expr.SetValue(row.Data[i].GetValue())
-		}
-	}
 
-	// Put rowKey to the tail of record row
-	rke := &RowKeyEntry{
-		Tbl:         e.t,
-		Handle:      handle,
-		TableAsName: e.tableAsName,
-	}
-	row.RowKeys = append(row.RowKeys, rke)
 	return row, nil
 }
 
-// Close implements Executor Close interface.
-func (e *TableScanExec) Close() error {
-	if e.iter != nil {
-		e.iter.Close()
-		e.iter = nil
-	}
+// Open implements the Executor Open interface.
+func (e *TableScanExec) Open(goCtx goctx.Context) error {
+	e.iter = nil
+	e.virtualTableRows = nil
+	e.virtualTableChunkList = nil
+	e.cursor = 0
 	return nil
 }
 
-// IndexRangeExec represents an index range scan executor.
-type IndexRangeExec struct {
-	scan *IndexScanExec
+// ExistsExec represents exists executor.
+type ExistsExec struct {
+	baseExecutor
 
-	// seekVal is different from lowVal, it is casted from lowVal and
-	// must be less than or equal to lowVal, used to seek the index.
-	lowVals     []types.Datum
-	lowExclude  bool
-	highVals    []types.Datum
-	highExclude bool
-
-	iter       kv.IndexIterator
-	skipLowCmp bool
-	finished   bool
+	evaluated bool
 }
 
-// Fields implements Executor Fields interface.
-func (e *IndexRangeExec) Fields() []*ast.ResultField {
-	return e.scan.fields
-}
-
-// Next implements Executor Next interface.
-func (e *IndexRangeExec) Next() (*Row, error) {
-	if e.iter == nil {
-		seekVals := make([]types.Datum, len(e.scan.idx.Columns))
-		for i := 0; i < len(e.lowVals); i++ {
-			if e.lowVals[i].Kind() == types.KindMinNotNull {
-				seekVals[i].SetBytes([]byte{})
-			} else {
-				val, err := e.lowVals[i].ConvertTo(e.scan.valueTypes[i])
-				seekVals[i] = val
-				if err != nil {
-					return nil, errors.Trace(err)
-				}
-			}
-		}
-		txn, err := e.scan.ctx.GetTxn(false)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		e.iter, _, err = e.scan.idx.X.Seek(txn, seekVals)
-		if err != nil {
-			return nil, types.EOFAsNil(err)
-		}
+// Open implements the Executor Open interface.
+func (e *ExistsExec) Open(goCtx goctx.Context) error {
+	if err := e.baseExecutor.Open(goCtx); err != nil {
+		return errors.Trace(err)
 	}
-
-	for {
-		if e.finished {
-			return nil, nil
-		}
-		idxKey, h, err := e.iter.Next()
-		if err != nil {
-			return nil, types.EOFAsNil(err)
-		}
-		if !e.skipLowCmp {
-			var cmp int
-			cmp, err = indexCompare(idxKey, e.lowVals)
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
-			if cmp < 0 || (cmp == 0 && e.lowExclude) {
-				continue
-			}
-			e.skipLowCmp = true
-		}
-		cmp, err := indexCompare(idxKey, e.highVals)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if cmp > 0 || (cmp == 0 && e.highExclude) {
-			// This span has finished iteration.
-			e.finished = true
-			continue
-		}
-		var row *Row
-		row, err = e.lookupRow(h)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		return row, nil
-	}
-}
-
-// indexCompare compares multi column index.
-// The length of boundVals may be less than idxKey.
-func indexCompare(idxKey []types.Datum, boundVals []types.Datum) (int, error) {
-	for i := 0; i < len(boundVals); i++ {
-		cmp, err := idxKey[i].CompareDatum(boundVals[i])
-		if err != nil {
-			return -1, errors.Trace(err)
-		}
-		if cmp != 0 {
-			return cmp, nil
-		}
-	}
-	return 0, nil
-}
-
-func (e *IndexRangeExec) lookupRow(h int64) (*Row, error) {
-	row := &Row{}
-	var err error
-	columns := make([]*column.Col, len(e.scan.fields))
-	for i, v := range e.scan.fields {
-		if v.Referenced {
-			columns[i] = e.scan.tbl.Cols()[i]
-		}
-	}
-	row.Data, err = e.scan.tbl.RowWithCols(e.scan.ctx, h, columns)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	rowKey := &RowKeyEntry{
-		Tbl:    e.scan.tbl,
-		Handle: h,
-	}
-	row.RowKeys = append(row.RowKeys, rowKey)
-	return row, nil
-}
-
-// Close implements Executor Close interface.
-func (e *IndexRangeExec) Close() error {
-	if e.iter != nil {
-		e.iter.Close()
-		e.iter = nil
-	}
-	e.finished = false
-	e.skipLowCmp = false
+	e.evaluated = false
 	return nil
 }
 
-// IndexScanExec represents an index scan executor.
-type IndexScanExec struct {
-	tbl         table.Table
-	tableAsName *model.CIStr
-	idx         *column.IndexedCol
-	fields      []*ast.ResultField
-	Ranges      []*IndexRangeExec
-	Desc        bool
-	rangeIdx    int
-	ctx         context.Context
-	valueTypes  []*types.FieldType
-}
-
-// Fields implements Executor Fields interface.
-func (e *IndexScanExec) Fields() []*ast.ResultField {
-	return e.fields
-}
-
-// Next implements Executor Next interface.
-func (e *IndexScanExec) Next() (*Row, error) {
-	for e.rangeIdx < len(e.Ranges) {
-		ran := e.Ranges[e.rangeIdx]
-		row, err := ran.Next()
+// Next implements the Executor Next interface.
+// We always return one row with one column which has true or false value.
+func (e *ExistsExec) Next(goCtx goctx.Context) (Row, error) {
+	if !e.evaluated {
+		e.evaluated = true
+		srcRow, err := e.children[0].Next(goCtx)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		if row != nil {
-			for i, val := range row.Data {
-				e.fields[i].Expr.SetValue(val.GetValue())
-			}
-			for _, entry := range row.RowKeys {
-				entry.TableAsName = e.tableAsName
-			}
-			return row, nil
-		}
-		ran.Close()
-		e.rangeIdx++
+		return Row{types.NewDatum(srcRow != nil)}, nil
 	}
 	return nil, nil
 }
 
-// Close implements Executor Close interface.
-func (e *IndexScanExec) Close() error {
-	for e.rangeIdx < len(e.Ranges) {
-		e.Ranges[e.rangeIdx].Close()
-		e.rangeIdx++
+// NextChunk implements the Executor NextChunk interface.
+func (e *ExistsExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+	if !e.evaluated {
+		e.evaluated = true
+		err := e.children[0].NextChunk(goCtx, e.childrenResults[0])
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if e.childrenResults[0].NumRows() > 0 {
+			chk.AppendInt64(0, 1)
+		} else {
+			chk.AppendInt64(0, 0)
+		}
 	}
 	return nil
 }
 
-// JoinOuterExec represents an outer join executor.
-type JoinOuterExec struct {
-	OuterExec Executor
-	InnerPlan plan.Plan
-	innerExec Executor
-	fields    []*ast.ResultField
-	builder   *executorBuilder
-	gotRow    bool
+// MaxOneRowExec checks if the number of rows that a query returns is at maximum one.
+// It's built from subquery expression.
+type MaxOneRowExec struct {
+	baseExecutor
+
+	evaluated bool
 }
 
-// Fields implements Executor Fields interface.
-func (e *JoinOuterExec) Fields() []*ast.ResultField {
-	return e.fields
-}
-
-// Next implements Executor Next interface.
-// The data in the returned row is not used by caller.
-// If inner executor didn't get any row for an outer executor row,
-// a row with 0 len Data indicates there is no inner row matched for
-// an outer row.
-func (e *JoinOuterExec) Next() (*Row, error) {
-	var rowKeys []*RowKeyEntry
-	for {
-		if e.innerExec == nil {
-			e.gotRow = false
-			outerRow, err := e.OuterExec.Next()
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
-			if outerRow == nil {
-				return nil, nil
-			}
-			rowKeys = outerRow.RowKeys
-			plan.Refine(e.InnerPlan)
-			e.innerExec = e.builder.build(e.InnerPlan)
-			if e.builder.err != nil {
-				return nil, errors.Trace(e.builder.err)
-			}
-		}
-		row, err := e.innerExec.Next()
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if row == nil {
-			e.innerExec.Close()
-			e.innerExec = nil
-			if e.gotRow {
-				continue
-			}
-			e.setInnerNull()
-			return &Row{RowKeys: rowKeys}, nil
-		}
-		if len(row.Data) != 0 {
-			e.gotRow = true
-			row.RowKeys = append(rowKeys, row.RowKeys...)
-			return row, nil
-		}
+// Open implements the Executor Open interface.
+func (e *MaxOneRowExec) Open(goCtx goctx.Context) error {
+	if err := e.baseExecutor.Open(goCtx); err != nil {
+		return errors.Trace(err)
 	}
-}
-
-func (e *JoinOuterExec) setInnerNull() {
-	for _, rf := range e.InnerPlan.Fields() {
-		rf.Expr.SetValue(nil)
-	}
-}
-
-// Close implements Executor Close interface.
-func (e *JoinOuterExec) Close() error {
-	err := e.OuterExec.Close()
-	if e.innerExec != nil {
-		return errors.Trace(e.innerExec.Close())
-	}
-	return errors.Trace(err)
-}
-
-// JoinInnerExec represents an inner join executor.
-type JoinInnerExec struct {
-	InnerPlans []plan.Plan
-	innerExecs []Executor
-	Condition  ast.ExprNode
-	ctx        context.Context
-	fields     []*ast.ResultField
-	builder    *executorBuilder
-	done       bool
-	cursor     int
-}
-
-// Fields implements Executor Fields interface.
-func (e *JoinInnerExec) Fields() []*ast.ResultField {
-	return e.fields
-}
-
-// Next implements Executor Next interface.
-// The data in the returned row is not used by caller.
-func (e *JoinInnerExec) Next() (*Row, error) {
-	if e.done {
-		return nil, nil
-	}
-	rowKeysSlice := make([][]*RowKeyEntry, len(e.InnerPlans))
-	for {
-		exec := e.innerExecs[e.cursor]
-		if exec == nil {
-			innerPlan := e.InnerPlans[e.cursor]
-			plan.Refine(innerPlan)
-			exec = e.builder.build(innerPlan)
-			if e.builder.err != nil {
-				return nil, errors.Trace(e.builder.err)
-			}
-			e.innerExecs[e.cursor] = exec
-		}
-		row, err := exec.Next()
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if row == nil {
-			exec.Close()
-			e.innerExecs[e.cursor] = nil
-			if e.cursor == 0 {
-				e.done = true
-				return nil, nil
-			}
-			e.cursor--
-			continue
-		}
-		rowKeysSlice[e.cursor] = row.RowKeys
-		if e.cursor < len(e.innerExecs)-1 {
-			e.cursor++
-			continue
-		}
-
-		var match = true
-		if e.Condition != nil {
-			match, err = evaluator.EvalBool(e.ctx, e.Condition)
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
-		}
-		if match {
-			row.RowKeys = joinRowKeys(rowKeysSlice)
-			return row, nil
-		}
-	}
-}
-
-func joinRowKeys(rowKeysSlice [][]*RowKeyEntry) []*RowKeyEntry {
-	count := 0
-	for _, rowKeys := range rowKeysSlice {
-		count += len(rowKeys)
-	}
-	joined := make([]*RowKeyEntry, count)
-	offset := 0
-	for _, rowKeys := range rowKeysSlice {
-		copy(joined[offset:], rowKeys)
-		offset += len(rowKeys)
-	}
-	return joined
-}
-
-// Close implements Executor Close interface.
-func (e *JoinInnerExec) Close() error {
-	var err error
-	for _, inExec := range e.innerExecs {
-		if inExec != nil {
-			e := inExec.Close()
-			if e != nil {
-				err = errors.Trace(e)
-			}
-		}
-	}
-	return err
-}
-
-// SelectFieldsExec represents a select fields executor.
-type SelectFieldsExec struct {
-	Src          Executor
-	ResultFields []*ast.ResultField
-	executed     bool
-	ctx          context.Context
-}
-
-// Fields implements Executor Fields interface.
-func (e *SelectFieldsExec) Fields() []*ast.ResultField {
-	return e.ResultFields
-}
-
-// Next implements Executor Next interface.
-func (e *SelectFieldsExec) Next() (*Row, error) {
-	var rowKeys []*RowKeyEntry
-	if e.Src != nil {
-		srcRow, err := e.Src.Next()
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if srcRow == nil {
-			return nil, nil
-		}
-		rowKeys = srcRow.RowKeys
-	} else {
-		// If Src is nil, only one row should be returned.
-		if e.executed {
-			return nil, nil
-		}
-	}
-	e.executed = true
-	row := &Row{
-		RowKeys: rowKeys,
-		Data:    make([]types.Datum, len(e.ResultFields)),
-	}
-	for i, field := range e.ResultFields {
-		val, err := evaluator.Eval(e.ctx, field.Expr)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		row.Data[i] = val
-	}
-	return row, nil
-}
-
-// Close implements Executor Close interface.
-func (e *SelectFieldsExec) Close() error {
-	if e.Src != nil {
-		return e.Src.Close()
-	}
+	e.evaluated = false
 	return nil
 }
 
-// FilterExec represents a filter executor.
-type FilterExec struct {
-	Src       Executor
-	Condition ast.ExprNode
-	ctx       context.Context
-}
-
-// Fields implements Executor Fields interface.
-func (e *FilterExec) Fields() []*ast.ResultField {
-	return e.Src.Fields()
-}
-
-// Next implements Executor Next interface.
-func (e *FilterExec) Next() (*Row, error) {
-	for {
-		srcRow, err := e.Src.Next()
+// Next implements the Executor Next interface.
+func (e *MaxOneRowExec) Next(goCtx goctx.Context) (Row, error) {
+	if !e.evaluated {
+		e.evaluated = true
+		srcRow, err := e.children[0].Next(goCtx)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
 		if srcRow == nil {
-			return nil, nil
+			return make([]types.Datum, e.schema.Len()), nil
 		}
-		match, err := evaluator.EvalBool(e.ctx, e.Condition)
+		srcRow1, err := e.children[0].Next(goCtx)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		if match {
-			return srcRow, nil
+		if srcRow1 != nil {
+			return nil, errors.New("subquery returns more than 1 row")
 		}
+		return srcRow, nil
 	}
+	return nil, nil
 }
 
-// Close implements Executor Close interface.
-func (e *FilterExec) Close() error {
-	return e.Src.Close()
-}
-
-// SelectLockExec represents a select lock executor.
-type SelectLockExec struct {
-	Src  Executor
-	Lock ast.SelectLockType
-	ctx  context.Context
-}
-
-// Fields implements Executor Fields interface.
-func (e *SelectLockExec) Fields() []*ast.ResultField {
-	return e.Src.Fields()
-}
-
-// Next implements Executor Next interface.
-func (e *SelectLockExec) Next() (*Row, error) {
-	row, err := e.Src.Next()
+// NextChunk implements the Executor NextChunk interface.
+func (e *MaxOneRowExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+	if e.evaluated {
+		return nil
+	}
+	e.evaluated = true
+	err := e.children[0].NextChunk(goCtx, chk)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return errors.Trace(err)
 	}
-	if row == nil {
-		return nil, nil
-	}
-	if len(row.RowKeys) != 0 && e.Lock == ast.SelectLockForUpdate {
-		forupdate.SetForUpdate(e.ctx)
-		for _, k := range row.RowKeys {
-			err = k.Tbl.LockRow(e.ctx, k.Handle, true)
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
+
+	if num := chk.NumRows(); num == 0 {
+		for i := range e.schema.Columns {
+			chk.AppendNull(i)
 		}
+		return nil
+	} else if num == 1 {
+		return nil
 	}
-	return row, nil
+
+	return errors.New("subquery returns more than 1 row")
 }
 
-// Close implements Executor Close interface.
-func (e *SelectLockExec) Close() error {
-	return e.Src.Close()
-}
-
-// LimitExec represents limit executor
-type LimitExec struct {
-	Src    Executor
-	Offset uint64
-	Count  uint64
-	Idx    uint64
-}
-
-// Fields implements Executor Fields interface.
-func (e *LimitExec) Fields() []*ast.ResultField {
-	return e.Src.Fields()
-}
-
-// Next implements Executor Next interface.
-func (e *LimitExec) Next() (*Row, error) {
-	for e.Idx < e.Offset {
-		srcRow, err := e.Src.Next()
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if srcRow == nil {
-			return nil, nil
-		}
-		e.Idx++
-	}
-	if e.Idx >= e.Count+e.Offset {
-		return nil, nil
-	}
-	srcRow, err := e.Src.Next()
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	if srcRow == nil {
-		return nil, nil
-	}
-	e.Idx++
-	return srcRow, nil
-}
-
-// Close implements Executor Close interface.
-func (e *LimitExec) Close() error {
-	return e.Src.Close()
-}
-
-// orderByRow binds a row to its order values, so it can be sorted.
-type orderByRow struct {
-	key []types.Datum
-	row *Row
-}
-
-// SortExec represents sorting executor.
-type SortExec struct {
-	Src     Executor
-	ByItems []*ast.ByItem
-	Rows    []*orderByRow
-	ctx     context.Context
-	Limit   *plan.Limit
-	Idx     int
-	fetched bool
-	err     error
-}
-
-// Fields implements Executor Fields interface.
-func (e *SortExec) Fields() []*ast.ResultField {
-	return e.Src.Fields()
-}
-
-// Len returns the number of rows.
-func (e *SortExec) Len() int {
-	return len(e.Rows)
-}
-
-// Swap implements sort.Interface Swap interface.
-func (e *SortExec) Swap(i, j int) {
-	e.Rows[i], e.Rows[j] = e.Rows[j], e.Rows[i]
-}
-
-// Less implements sort.Interface Less interface.
-func (e *SortExec) Less(i, j int) bool {
-	for index, by := range e.ByItems {
-		v1 := e.Rows[i].key[index]
-		v2 := e.Rows[j].key[index]
-
-		ret, err := v1.CompareDatum(v2)
-		if err != nil {
-			e.err = err
-			return true
-		}
-
-		if by.Desc {
-			ret = -ret
-		}
-
-		if ret < 0 {
-			return true
-		} else if ret > 0 {
-			return false
-		}
-	}
-
-	return false
-}
-
-// SortBufferSize represents the total extra row count that sort can use.
-var SortBufferSize = 500
-
-// Next implements Executor Next interface.
-func (e *SortExec) Next() (*Row, error) {
-	if !e.fetched {
-		offset := -1
-		totalCount := -1
-		if e.Limit != nil {
-			offset = int(e.Limit.Offset)
-			totalCount = offset + int(e.Limit.Count)
-		}
-		for {
-			srcRow, err := e.Src.Next()
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
-			if srcRow == nil {
-				break
-			}
-			orderRow := &orderByRow{
-				row: srcRow,
-				key: make([]types.Datum, len(e.ByItems)),
-			}
-			for i, byItem := range e.ByItems {
-				orderRow.key[i], err = evaluator.Eval(e.ctx, byItem.Expr)
-				if err != nil {
-					return nil, errors.Trace(err)
-				}
-			}
-			e.Rows = append(e.Rows, orderRow)
-			if totalCount != -1 && e.Len() >= totalCount+SortBufferSize {
-				sort.Sort(e)
-				e.Rows = e.Rows[:totalCount]
-			}
-		}
-		sort.Sort(e)
-		if offset >= 0 && offset < e.Len() {
-			if totalCount > e.Len() {
-				e.Rows = e.Rows[offset:]
-			} else {
-				e.Rows = e.Rows[offset:totalCount]
-			}
-		} else if offset != -1 {
-			e.Rows = e.Rows[:0]
-		}
-		e.fetched = true
-	}
-	if e.err != nil {
-		return nil, errors.Trace(e.err)
-	}
-	if e.Idx >= len(e.Rows) {
-		return nil, nil
-	}
-	row := e.Rows[e.Idx].row
-	e.Idx++
-	return row, nil
-}
-
-// Close implements Executor Close interface.
-func (e *SortExec) Close() error {
-	return e.Src.Close()
-}
-
-// For select stmt with aggregate function but without groupby clasue,
-// We consider there is a single group with key singleGroup.
-const singleGroup = "SingleGroup"
-
-// AggregateExec deals with all the aggregate functions.
-// It is built from Aggregate Plan. When Next() is called, it reads all the data from Src and updates all the items in AggFuncs.
-// TODO: Support having.
-type AggregateExec struct {
-	Src               Executor
-	ResultFields      []*ast.ResultField
-	executed          bool
-	ctx               context.Context
-	finish            bool
-	AggFuncs          []*ast.AggregateFuncExpr
-	groupMap          map[string]bool
-	groups            []string
-	currentGroupIndex int
-	GroupByItems      []*ast.ByItem
-}
-
-// Fields implements Executor Fields interface.
-func (e *AggregateExec) Fields() []*ast.ResultField {
-	return e.ResultFields
-}
-
-// Next implements Executor Next interface.
-func (e *AggregateExec) Next() (*Row, error) {
-	// In this stage we consider all data from src as a single group.
-	if !e.executed {
-		e.groupMap = make(map[string]bool)
-		e.groups = []string{}
-		for {
-			hasMore, err := e.innerNext()
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
-			if !hasMore {
-				break
-			}
-		}
-		e.executed = true
-		if (len(e.groups) == 0) && (len(e.GroupByItems) == 0) {
-			// If no groupby and no data, we should add an empty group.
-			// For example:
-			// "select count(c) from t;" should return one row [0]
-			// "select count(c) from t group by c1;" should return empty result set.
-			e.groups = append(e.groups, singleGroup)
-		}
-	}
-	if e.currentGroupIndex >= len(e.groups) {
-		return nil, nil
-	}
-	groupKey := e.groups[e.currentGroupIndex]
-	for _, af := range e.AggFuncs {
-		af.CurrentGroup = groupKey
-	}
-	e.currentGroupIndex++
-	return &Row{}, nil
-}
-
-func (e *AggregateExec) getGroupKey() (string, error) {
-	if len(e.GroupByItems) == 0 {
-		return singleGroup, nil
-	}
-	vals := make([]types.Datum, 0, len(e.GroupByItems))
-	for _, item := range e.GroupByItems {
-		v, err := evaluator.Eval(e.ctx, item.Expr)
-		if err != nil {
-			return "", errors.Trace(err)
-		}
-		vals = append(vals, v)
-	}
-	bs, err := codec.EncodeValue([]byte{}, vals...)
-	if err != nil {
-		return "", errors.Trace(err)
-	}
-	return string(bs), nil
-}
-
-// Fetch a single row from src and update each aggregate function.
-// If the first return value is false, it means there is no more data from src.
-func (e *AggregateExec) innerNext() (bool, error) {
-	if e.Src != nil {
-		srcRow, err := e.Src.Next()
-		if err != nil {
-			return false, errors.Trace(err)
-		}
-		if srcRow == nil {
-			return false, nil
-		}
-	} else {
-		// If Src is nil, only one row should be returned.
-		if e.executed {
-			return false, nil
-		}
-	}
-	e.executed = true
-	groupKey, err := e.getGroupKey()
-	if err != nil {
-		return false, errors.Trace(err)
-	}
-	if _, ok := e.groupMap[groupKey]; !ok {
-		e.groupMap[groupKey] = true
-		e.groups = append(e.groups, groupKey)
-	}
-	for _, af := range e.AggFuncs {
-		for _, arg := range af.Args {
-			_, err := evaluator.Eval(e.ctx, arg)
-			if err != nil {
-				return false, errors.Trace(err)
-			}
-		}
-		af.CurrentGroup = groupKey
-		af.Update()
-	}
-	return true, nil
-}
-
-// Close implements Executor Close interface.
-func (e *AggregateExec) Close() error {
-	for _, af := range e.AggFuncs {
-		af.Clear()
-	}
-	if e.Src != nil {
-		return e.Src.Close()
-	}
-	return nil
-}
-
-// UnionExec represents union executor.
+// UnionExec pulls all it's children's result and returns to its parent directly.
+// A "resultPuller" is started for every child to pull result from that child and push it to the "resultPool", the used
+// "Chunk" is obtained from the corresponding "resourcePool". All resultPullers are running concurrently.
+//                             +----------------+
+//   +---> resourcePool 1 ---> | resultPuller 1 |-----+
+//   |                         +----------------+     |
+//   |                                                |
+//   |                         +----------------+     v
+//   +---> resourcePool 2 ---> | resultPuller 2 |-----> resultPool ---+
+//   |                         +----------------+     ^               |
+//   |                               ......           |               |
+//   |                         +----------------+     |               |
+//   +---> resourcePool n ---> | resultPuller n |-----+               |
+//   |                         +----------------+                     |
+//   |                                                                |
+//   |                          +-------------+                       |
+//   |--------------------------| main thread | <---------------------+
+//                              +-------------+
 type UnionExec struct {
-	fields []*ast.ResultField
-	Sels   []Executor
-	cursor int
+	baseExecutor
+
+	stopFetchData atomic.Value
+	resultCh      chan *execResult
+	rows          []Row
+	cursor        int
+	wg            sync.WaitGroup
+
+	// finished and all the following variables are used for chunk execution.
+	finished      chan struct{}
+	resourcePools []chan *chunk.Chunk
+	resultPool    chan *unionWorkerResult
+	initialized   bool
 }
 
-// Fields implements Executor Fields interface.
-func (e *UnionExec) Fields() []*ast.ResultField {
-	return e.fields
+type execResult struct {
+	rows []Row
+	err  error
 }
 
-// Next implements Executor Next interface.
-func (e *UnionExec) Next() (*Row, error) {
+// unionWorkerResult stores the result for a union worker.
+// A "resultPuller" is started for every child to pull result from that child, unionWorkerResult is used to store that pulled result.
+// "src" is used for Chunk reuse: after pulling result from "resultPool", main-thread must push a valid unused Chunk to "src" to
+// enable the corresponding "resultPuller" continue to work.
+type unionWorkerResult struct {
+	chk *chunk.Chunk
+	err error
+	src chan<- *chunk.Chunk
+}
+
+func (e *UnionExec) waitAllFinished(forChunk bool) {
+	e.wg.Wait()
+	if forChunk {
+		close(e.resultPool)
+	} else {
+		close(e.resultCh)
+	}
+}
+
+func (e *UnionExec) fetchData(goCtx goctx.Context, idx int) {
+	batchSize := 128
+	defer e.wg.Done()
 	for {
-		if e.cursor >= len(e.Sels) {
-			return nil, nil
+		result := &execResult{
+			rows: make([]Row, 0, batchSize),
+			err:  nil,
 		}
-		sel := e.Sels[e.cursor]
-		row, err := sel.Next()
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if row == nil {
-			e.cursor++
-			continue
-		}
-		if e.cursor != 0 {
-			for i := range row.Data {
-				// The column value should be casted as the same type of the first select statement in corresponding position
-				rf := e.fields[i]
-				var val types.Datum
-				val, err = row.Data[i].ConvertTo(&rf.Column.FieldType)
-				if err != nil {
-					return nil, errors.Trace(err)
-				}
-				row.Data[i] = val
+		for i := 0; i < batchSize; i++ {
+			if e.stopFetchData.Load().(bool) {
+				return
 			}
-		}
-		for i, v := range row.Data {
-			e.fields[i].Expr.SetValue(v.GetValue())
-		}
-		return row, nil
-	}
-}
-
-// Close implements Executor Close interface.
-func (e *UnionExec) Close() error {
-	var err error
-	for _, sel := range e.Sels {
-		er := sel.Close()
-		if er != nil {
-			err = errors.Trace(er)
-		}
-	}
-	return err
-}
-
-// DistinctExec represents Distinct executor.
-type DistinctExec struct {
-	Src     Executor
-	checker *distinct.Checker
-}
-
-// Fields implements Executor Fields interface.
-func (e *DistinctExec) Fields() []*ast.ResultField {
-	return e.Src.Fields()
-}
-
-// Next implements Executor Next interface.
-func (e *DistinctExec) Next() (*Row, error) {
-	if e.checker == nil {
-		e.checker = distinct.CreateDistinctChecker()
-	}
-	for {
-		row, err := e.Src.Next()
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if row == nil {
-			return nil, nil
-		}
-		ok, err := e.checker.Check(types.DatumsToInterfaces(row.Data))
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if !ok {
-			continue
-		}
-		return row, nil
-	}
-}
-
-// Close implements Executor Close interface.
-func (e *DistinctExec) Close() error {
-	return e.Src.Close()
-}
-
-// ReverseExec produces reverse ordered result, it is used to wrap executors that do not support reverse scan.
-type ReverseExec struct {
-	Src    Executor
-	rows   []*Row
-	cursor int
-	done   bool
-}
-
-// Fields implements Executor Fields interface.
-func (e *ReverseExec) Fields() []*ast.ResultField {
-	return e.Src.Fields()
-}
-
-// Next implements Executor Next interface.
-func (e *ReverseExec) Next() (*Row, error) {
-	if !e.done {
-		for {
-			row, err := e.Src.Next()
+			row, err := e.children[idx].Next(goCtx)
 			if err != nil {
-				return nil, errors.Trace(err)
+				result.err = errors.Trace(err)
+				break
 			}
 			if row == nil {
 				break
 			}
-			e.rows = append(e.rows, row)
+			result.rows = append(result.rows, row)
 		}
-		e.cursor = len(e.rows) - 1
-		e.done = true
+		if len(result.rows) == 0 && result.err == nil {
+			return
+		}
+		if result.err != nil {
+			e.stopFetchData.Store(true)
+		}
+		select {
+		case e.resultCh <- result:
+		case <-e.finished:
+			return
+		}
 	}
-	if e.cursor < 0 {
-		return nil, nil
+}
+
+// Open implements the Executor Open interface.
+func (e *UnionExec) Open(goCtx goctx.Context) error {
+	if err := e.baseExecutor.Open(goCtx); err != nil {
+		return errors.Trace(err)
+	}
+	e.stopFetchData.Store(false)
+	e.initialized = false
+	e.finished = make(chan struct{})
+	return nil
+}
+
+func (e *UnionExec) initialize(goCtx goctx.Context, forChunk bool) {
+	if forChunk {
+		e.resultPool = make(chan *unionWorkerResult, len(e.children))
+		e.resourcePools = make([]chan *chunk.Chunk, len(e.children))
+		for i := range e.children {
+			e.resourcePools[i] = make(chan *chunk.Chunk, 1)
+			e.resourcePools[i] <- e.childrenResults[i]
+			e.wg.Add(1)
+			go e.resultPuller(goCtx, i)
+		}
+	} else {
+		e.resultCh = make(chan *execResult, len(e.children))
+		e.cursor = 0
+		for i := range e.children {
+			e.wg.Add(1)
+			go e.fetchData(goCtx, i)
+		}
+	}
+	go e.waitAllFinished(forChunk)
+}
+
+func (e *UnionExec) resultPuller(goCtx goctx.Context, childID int) {
+	defer e.wg.Done()
+	result := &unionWorkerResult{
+		err: nil,
+		chk: nil,
+		src: e.resourcePools[childID],
+	}
+	for {
+		if e.stopFetchData.Load().(bool) {
+			return
+		}
+		select {
+		case <-e.finished:
+			return
+		case result.chk = <-e.resourcePools[childID]:
+		}
+		result.err = errors.Trace(e.children[childID].NextChunk(goCtx, result.chk))
+		if result.err == nil && result.chk.NumRows() == 0 {
+			return
+		}
+		e.resultPool <- result
+		if result.err != nil {
+			e.stopFetchData.Store(true)
+			return
+		}
+	}
+}
+
+// Next implements the Executor Next interface.
+func (e *UnionExec) Next(goCtx goctx.Context) (Row, error) {
+	if !e.initialized {
+		e.initialize(goCtx, false)
+		e.initialized = true
+	}
+	if e.cursor >= len(e.rows) {
+		result, ok := <-e.resultCh
+		if !ok {
+			return nil, nil
+		}
+		if result.err != nil {
+			return nil, errors.Trace(result.err)
+		}
+		if len(result.rows) == 0 {
+			return nil, nil
+		}
+		e.rows = result.rows
+		e.cursor = 0
 	}
 	row := e.rows[e.cursor]
-	e.cursor--
+	e.cursor++
 	return row, nil
 }
 
-// Close implements Executor Close interface.
-func (e *ReverseExec) Close() error {
-	return e.Src.Close()
+// NextChunk implements the Executor NextChunk interface.
+func (e *UnionExec) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
+	chk.Reset()
+	if !e.initialized {
+		e.initialize(nil, true)
+		e.initialized = true
+	}
+	result, ok := <-e.resultPool
+	if !ok {
+		return nil
+	}
+	if result.err != nil {
+		return errors.Trace(result.err)
+	}
+
+	chk.SwapColumns(result.chk)
+	result.src <- result.chk
+	return nil
+}
+
+// Close implements the Executor Close interface.
+func (e *UnionExec) Close() error {
+	e.rows = nil
+	close(e.finished)
+	if e.resultPool != nil {
+		for range e.resultPool {
+		}
+	}
+	e.resourcePools = nil
+	return errors.Trace(e.baseExecutor.Close())
 }

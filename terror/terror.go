@@ -14,38 +14,43 @@
 package terror
 
 import (
+	"encoding/json"
 	"fmt"
 	"runtime"
 	"strconv"
 
 	"github.com/juju/errors"
-	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/mysql"
+	log "github.com/sirupsen/logrus"
 )
 
-// Common base error instances.
+// Global error instances.
 var (
-	CommitNotInTransaction   = ClassExecutor.New(CodeCommitNotInTransaction, "commit not in transaction")
-	RollbackNotInTransaction = ClassExecutor.New(CodeRollbackNotInTransaction, "rollback not in transaction")
-	ExecResultIsEmpty        = ClassExecutor.New(CodeExecResultIsEmpty, "exec result is empty")
-
-	MissConnectionID = ClassExpression.New(CodeMissConnectionID, "miss connection id information")
+	ErrCritical           = ClassGlobal.New(CodeExecResultIsEmpty, "critical error %v")
+	ErrResultUndetermined = ClassGlobal.New(CodeResultUndetermined, "execution result undetermined")
 )
 
 // ErrCode represents a specific error type in a error class.
 // Same error code can be used in different error classes.
 type ErrCode int
 
-// Executor error codes.
 const (
-	CodeCommitNotInTransaction   ErrCode = 1
-	CodeRollbackNotInTransaction         = 2
-	CodeExecResultIsEmpty                = 3
-)
+	// Executor error codes.
 
-// Expression error codes.
-const (
-	CodeMissConnectionID ErrCode = iota + 1
+	// CodeUnknown is for errors of unknown reason.
+	CodeUnknown ErrCode = -1
+	// CodeExecResultIsEmpty indicates execution result is empty.
+	CodeExecResultIsEmpty ErrCode = 3
+
+	// Expression error codes.
+
+	// CodeMissConnectionID indicates connection id is missing.
+	CodeMissConnectionID ErrCode = 1
+
+	// Special error codes.
+
+	// CodeResultUndetermined indicates the sql execution result is undetermined.
+	CodeResultUndetermined ErrCode = 2
 )
 
 // ErrClass represents a class of errors.
@@ -59,7 +64,7 @@ const (
 	ClassEvaluator
 	ClassExecutor
 	ClassExpression
-	ClassInspectkv
+	ClassAdmin
 	ClassKV
 	ClassMeta
 	ClassOptimizer
@@ -72,44 +77,45 @@ const (
 	ClassStructure
 	ClassVariable
 	ClassXEval
+	ClassTable
+	ClassTypes
+	ClassGlobal
+	ClassMockTikv
+	ClassJSON
+	ClassTiKV
 	// Add more as needed.
 )
 
+var errClz2Str = map[ErrClass]string{
+	ClassAutoid:        "autoid",
+	ClassDDL:           "ddl",
+	ClassDomain:        "domain",
+	ClassExecutor:      "executor",
+	ClassExpression:    "expression",
+	ClassAdmin:         "admin",
+	ClassMeta:          "meta",
+	ClassKV:            "kv",
+	ClassOptimizer:     "optimizer",
+	ClassOptimizerPlan: "plan",
+	ClassParser:        "parser",
+	ClassPerfSchema:    "perfschema",
+	ClassPrivilege:     "privilege",
+	ClassSchema:        "schema",
+	ClassServer:        "server",
+	ClassStructure:     "structure",
+	ClassVariable:      "variable",
+	ClassTable:         "table",
+	ClassTypes:         "types",
+	ClassGlobal:        "global",
+	ClassMockTikv:      "mocktikv",
+	ClassJSON:          "json",
+	ClassTiKV:          "tikv",
+}
+
 // String implements fmt.Stringer interface.
 func (ec ErrClass) String() string {
-	switch ec {
-	case ClassAutoid:
-		return "autoid"
-	case ClassDDL:
-		return "ddl"
-	case ClassDomain:
-		return "domain"
-	case ClassExecutor:
-		return "executor"
-	case ClassExpression:
-		return "expression"
-	case ClassInspectkv:
-		return "inspectkv"
-	case ClassMeta:
-		return "meta"
-	case ClassKV:
-		return "kv"
-	case ClassOptimizer:
-		return "optimizer"
-	case ClassParser:
-		return "parser"
-	case ClassPerfSchema:
-		return "perfschema"
-	case ClassPrivilege:
-		return "privilege"
-	case ClassSchema:
-		return "schema"
-	case ClassServer:
-		return "server"
-	case ClassStructure:
-		return "structure"
-	case ClassVariable:
-		return "variable"
+	if s, exists := errClz2Str[ec]; exists {
+		return s
 	}
 	return strconv.Itoa(int(ec))
 }
@@ -147,6 +153,7 @@ type Error struct {
 	class   ErrClass
 	code    ErrCode
 	message string
+	args    []interface{}
 	file    string
 	line    int
 }
@@ -161,6 +168,37 @@ func (e *Error) Code() ErrCode {
 	return e.code
 }
 
+// MarshalJSON implements json.Marshaler interface.
+func (e *Error) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		Class ErrClass `json:"class"`
+		Code  ErrCode  `json:"code"`
+		Msg   string   `json:"message"`
+	}{
+		Class: e.class,
+		Code:  e.code,
+		Msg:   e.getMsg(),
+	})
+}
+
+// UnmarshalJSON implements json.Unmarshaler interface.
+func (e *Error) UnmarshalJSON(data []byte) error {
+	err := &struct {
+		Class ErrClass `json:"class"`
+		Code  ErrCode  `json:"code"`
+		Msg   string   `json:"message"`
+	}{}
+
+	if err := json.Unmarshal(data, &err); err != nil {
+		return errors.Trace(err)
+	}
+
+	e.class = err.Class
+	e.code = err.Code
+	e.message = err.Msg
+	return nil
+}
+
 // Location returns the location where the error is created,
 // implements juju/errors locationer interface.
 func (e *Error) Location() (file string, line int) {
@@ -169,14 +207,39 @@ func (e *Error) Location() (file string, line int) {
 
 // Error implements error interface.
 func (e *Error) Error() string {
-	return fmt.Sprintf("[%s:%d]%s", e.class, e.code, e.message)
+	return fmt.Sprintf("[%s:%d]%s", e.class, e.code, e.getMsg())
+}
+
+func (e *Error) getMsg() string {
+	if len(e.args) > 0 {
+		return fmt.Sprintf(e.message, e.args...)
+	}
+	return e.message
 }
 
 // Gen generates a new *Error with the same class and code, and a new formatted message.
 func (e *Error) Gen(format string, args ...interface{}) *Error {
 	err := *e
-	err.message = fmt.Sprintf(format, args...)
+	err.message = format
+	err.args = args
 	_, err.file, err.line, _ = runtime.Caller(1)
+	return &err
+}
+
+// GenByArgs generates a new *Error with the same class and code, and new arguments.
+func (e *Error) GenByArgs(args ...interface{}) *Error {
+	err := *e
+	err.args = args
+	_, err.file, err.line, _ = runtime.Caller(1)
+	return &err
+}
+
+// FastGen generates a new *Error with the same class and code, and a new formatted message.
+// This will not call runtime.Caller to get file and line.
+func (e *Error) FastGen(format string, args ...interface{}) *Error {
+	err := *e
+	err.message = format
+	err.args = args
 	return &err
 }
 
@@ -185,6 +248,10 @@ func (e *Error) Equal(err error) bool {
 	originErr := errors.Cause(err)
 	if originErr == nil {
 		return false
+	}
+
+	if error(e) == originErr {
+		return true
 	}
 	inErr, ok := originErr.(*Error)
 	return ok && e.class == inErr.class && e.code == inErr.code
@@ -198,7 +265,7 @@ func (e *Error) NotEqual(err error) bool {
 // ToSQLError convert Error to mysql.SQLError.
 func (e *Error) ToSQLError() *mysql.SQLError {
 	code := e.getMySQLErrorCode()
-	return mysql.NewErrf(code, e.message)
+	return mysql.NewErrf(code, "%s", e.getMsg())
 }
 
 var defaultMySQLErrorCode uint16
@@ -218,22 +285,12 @@ func (e *Error) getMySQLErrorCode() uint16 {
 }
 
 var (
-	// ErrCode to mysql error code map.
-	parserMySQLErrCodes     = map[ErrCode]uint16{}
-	executorMySQLErrCodes   = map[ErrCode]uint16{}
-	serverMySQLErrCodes     = map[ErrCode]uint16{}
-	expressionMySQLErrCodes = map[ErrCode]uint16{}
-
 	// ErrClassToMySQLCodes is the map of ErrClass to code-map.
-	ErrClassToMySQLCodes map[ErrClass](map[ErrCode]uint16)
+	ErrClassToMySQLCodes map[ErrClass]map[ErrCode]uint16
 )
 
 func init() {
-	ErrClassToMySQLCodes = make(map[ErrClass](map[ErrCode]uint16))
-	ErrClassToMySQLCodes[ClassExecutor] = executorMySQLErrCodes
-	ErrClassToMySQLCodes[ClassExpression] = expressionMySQLErrCodes
-	ErrClassToMySQLCodes[ClassParser] = parserMySQLErrCodes
-	ErrClassToMySQLCodes[ClassServer] = serverMySQLErrCodes
+	ErrClassToMySQLCodes = make(map[ErrClass]map[ErrCode]uint16)
 	defaultMySQLErrorCode = mysql.ErrUnknown
 }
 
@@ -262,4 +319,26 @@ func ErrorEqual(err1, err2 error) bool {
 // ErrorNotEqual returns a boolean indicating whether err1 isn't equal to err2.
 func ErrorNotEqual(err1, err2 error) bool {
 	return !ErrorEqual(err1, err2)
+}
+
+// MustNil fatals if err is not nil.
+func MustNil(err error) {
+	if err != nil {
+		log.Fatalf(errors.ErrorStack(err))
+	}
+}
+
+// Call executes a function and checks the returned err.
+func Call(fn func() error) {
+	err := fn()
+	if err != nil {
+		log.Error(errors.ErrorStack(err))
+	}
+}
+
+// Log logs the error if it is not nil.
+func Log(err error) {
+	if err != nil {
+		log.Error(errors.ErrorStack(err))
+	}
 }

@@ -14,12 +14,13 @@
 package kv
 
 import (
-	"bytes"
-	"io"
+	"github.com/pingcap/tidb/store/tikv/oracle"
+	goctx "golang.org/x/net/context"
 )
 
+// Transaction options
 const (
-	// PresumeKeyNotExists directives that when dealing with a Get operation but failing to read data from cache,
+	// PresumeKeyNotExists indicates that when dealing with a Get operation but failing to read data from cache,
 	// we presume that the key does not exist in Store. The actual existence will be checked before the
 	// transaction's commit.
 	// This option is an optimization for frequent checks during a transaction, e.g. batch inserts.
@@ -27,6 +28,47 @@ const (
 	// PresumeKeyNotExistsError is the option key for error.
 	// When PresumeKeyNotExists is set and condition is not match, should throw the error.
 	PresumeKeyNotExistsError
+	// BinlogInfo contains the binlog data and client.
+	BinlogInfo
+	// Skip existing check when "prewrite".
+	SkipCheckForWrite
+	// SchemaLeaseChecker is used for schema lease check.
+	SchemaLeaseChecker
+	// IsolationLevel sets isolation level for current transaction. The default level is SI.
+	IsolationLevel
+	// Priority marks the priority of this transaction.
+	Priority
+	// NotFillCache makes this request do not touch the LRU cache of the underlying storage.
+	NotFillCache
+	// SyncLog decides whether the WAL(write-ahead log) of this request should be synchronized.
+	SyncLog
+)
+
+// Priority value for transaction priority.
+const (
+	PriorityNormal = iota
+	PriorityLow
+	PriorityHigh
+)
+
+// IsoLevel is the transaction's isolation level.
+type IsoLevel int
+
+const (
+	// SI stands for 'snapshot isolation'.
+	SI IsoLevel = iota
+	// RC stands for 'read committed'.
+	RC
+)
+
+// Those limits is enforced to make sure the transaction can be well handled by TiKV.
+var (
+	// TxnEntrySizeLimit is limit of single entry size (len(key) + len(value)).
+	TxnEntrySizeLimit = 6 * 1024 * 1024
+	// TxnEntryCountLimit  is limit of number of entries in the MemBuffer.
+	TxnEntryCountLimit uint64 = 300 * 1000
+	// TxnTotalSizeLimit is limit of the sum of all entry size.
+	TxnTotalSizeLimit = 100 * 1024 * 1024
 )
 
 // Retriever is the interface wraps the basic Get and Seek methods.
@@ -60,19 +102,26 @@ type RetrieverMutator interface {
 	Mutator
 }
 
-// MemBuffer is an in-memory kv collection. It should be released after use.
+// MemBuffer is an in-memory kv collection, can be used to buffer write operations.
 type MemBuffer interface {
 	RetrieverMutator
-	// Release releases the buffer.
-	Release()
+	// Size returns sum of keys and values length.
+	Size() int
+	// Len returns the number of entries in the DB.
+	Len() int
+	// Reset cleanup the MemBuffer
+	Reset()
+	// SetCap sets the MemBuffer capability, to reduce memory allocations.
+	// Please call it before you use the MemBuffer, otherwise it will not works.
+	SetCap(cap int)
 }
 
 // Transaction defines the interface for operations inside a Transaction.
 // This is not thread safe.
 type Transaction interface {
-	RetrieverMutator
+	MemBuffer
 	// Commit commits the transaction operations to KV store.
-	Commit() error
+	Commit(goctx.Context) error
 	// Rollback undoes the transaction operations to KV store.
 	Rollback() error
 	// String implements fmt.Stringer interface.
@@ -86,61 +135,77 @@ type Transaction interface {
 	DelOption(opt Option)
 	// IsReadOnly checks if the transaction has only performed read operations.
 	IsReadOnly() bool
-	// GetClient gets a client instance.
-	GetClient() Client
 	// StartTS returns the transaction start timestamp.
 	StartTS() uint64
+	// Valid returns if the transaction is valid.
+	// A transaction become invalid after commit or rollback.
+	Valid() bool
+	// GetMemBuffer return the MemBuffer binding to this transaction.
+	GetMemBuffer() MemBuffer
+	// GetSnapshot returns the snapshot of this transaction.
+	GetSnapshot() Snapshot
 }
 
 // Client is used to send request to KV layer.
 type Client interface {
 	// Send sends request to KV layer, returns a Response.
-	Send(req *Request) Response
+	Send(ctx goctx.Context, req *Request) Response
 
-	// SupportRequestType checks if reqType and subType is supported.
-	SupportRequestType(reqType, subType int64) bool
+	// IsRequestTypeSupported checks if reqType and subType is supported.
+	IsRequestTypeSupported(reqType, subType int64) bool
 }
 
 // ReqTypes.
 const (
-	ReqTypeSelect = 101
-	ReqTypeIndex  = 102
+	ReqTypeSelect  = 101
+	ReqTypeIndex   = 102
+	ReqTypeDAG     = 103
+	ReqTypeAnalyze = 104
 
-	ReqSubTypeBasic = 0
-	ReqSubTypeDesc  = 10000
+	ReqSubTypeBasic      = 0
+	ReqSubTypeDesc       = 10000
+	ReqSubTypeGroupBy    = 10001
+	ReqSubTypeTopN       = 10002
+	ReqSubTypeSignature  = 10003
+	ReqSubTypeAnalyzeIdx = 10004
+	ReqSubTypeAnalyzeCol = 10005
+	ReqSubTypeStreamAgg  = 10006
 )
-
-// KeyRange represents a range where StartKey <= key < EndKey.
-type KeyRange struct {
-	StartKey Key
-	EndKey   Key
-}
-
-// IsPoint checks if the key range represents a point.
-func (r *KeyRange) IsPoint() bool {
-	return bytes.Equal(r.StartKey.PrefixNext(), r.EndKey)
-}
 
 // Request represents a kv request.
 type Request struct {
-	// The request type.
-	Tp   int64
-	Data []byte
-	// Key Ranges
+	// Tp is the request type.
+	Tp        int64
+	StartTs   uint64
+	Data      []byte
 	KeyRanges []KeyRange
-	// If desc is true, the request is sent in descending order.
+	// KeepOrder is true, if the response should be returned in order.
+	KeepOrder bool
+	// Desc is true, if the request is sent in descending order.
 	Desc bool
-	// If concurrency is 1, it only sends the request to a single storage unit when
+	// Concurrency is 1, if it only sends the request to a single storage unit when
 	// ResponseIterator.Next is called. If concurrency is greater than 1, the request will be
 	// sent to multiple storage units concurrently.
 	Concurrency int
+	// IsolationLevel is the isolation level, default is SI.
+	IsolationLevel IsoLevel
+	// Priority is the priority of this KV request, its value may be PriorityNormal/PriorityLow/PriorityHigh.
+	Priority int
+	// NotFillCache makes this request do not touch the LRU cache of the underlying storage.
+	NotFillCache bool
+	// SyncLog decides whether the WAL(write-ahead log) of this request should be synchronized.
+	SyncLog bool
+	// Streaming indicates using streaming API for this request, result in that one Next()
+	// call would not corresponds to a whole region result.
+	Streaming bool
 }
 
 // Response represents the response returned from KV layer.
 type Response interface {
 	// Next returns a resultSubset from a single storage unit.
 	// When full result set is returned, nil is returned.
-	Next() (resultSubset io.ReadCloser, err error)
+	// TODO: Find a better interface for resultSubset that can avoid allocation and reuse bytes.
+	Next(ctx goctx.Context) (resultSubset []byte, err error)
 	// Close response.
 	Close() error
 }
@@ -150,8 +215,6 @@ type Snapshot interface {
 	Retriever
 	// BatchGet gets a batch of values from snapshot.
 	BatchGet(keys []Key) (map[string][]byte, error)
-	// Release releases the snapshot to store.
-	Release()
 }
 
 // Driver is the interface that must be implemented by a KV storage.
@@ -166,15 +229,23 @@ type Driver interface {
 type Storage interface {
 	// Begin transaction
 	Begin() (Transaction, error)
+	// BeginWithStartTS begins transaction with startTS.
+	BeginWithStartTS(startTS uint64) (Transaction, error)
 	// GetSnapshot gets a snapshot that is able to read any data which data is <= ver.
 	// if ver is MaxVersion or > current max committed version, we will use current version for this snapshot.
 	GetSnapshot(ver Version) (Snapshot, error)
+	// GetClient gets a client instance.
+	GetClient() Client
 	// Close store
 	Close() error
-	// Storage's unique ID
+	// UUID return a unique ID which represents a Storage.
 	UUID() string
 	// CurrentVersion returns current max committed version.
 	CurrentVersion() (Version, error)
+	// GetOracle gets a timestamp oracle client.
+	GetOracle() oracle.Oracle
+	// SupportDeleteRange gets the storage support delete range or not.
+	SupportDeleteRange() (supported bool)
 }
 
 // FnKeyCmp is the function for iterator the keys

@@ -17,9 +17,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ngaut/log"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/kv"
+	log "github.com/sirupsen/logrus"
+	goctx "golang.org/x/net/context"
 )
 
 type testSnapshotSuite struct {
@@ -47,7 +48,7 @@ func (s *testSnapshotSuite) TearDownSuite(c *C) {
 		c.Assert(err, IsNil)
 		scanner.Next()
 	}
-	err = txn.Commit()
+	err = txn.Commit(goctx.Background())
 	c.Assert(err, IsNil)
 	err = s.store.Close()
 	c.Assert(err, IsNil)
@@ -77,7 +78,7 @@ func (s *testSnapshotSuite) checkAll(keys []kv.Key, c *C) {
 		c.Assert(v, BytesEquals, v2)
 		scan.Next()
 	}
-	err = txn.Commit()
+	err = txn.Commit(goctx.Background())
 	c.Assert(err, IsNil)
 	c.Assert(m, HasLen, cnt)
 }
@@ -88,7 +89,7 @@ func (s *testSnapshotSuite) deleteKeys(keys []kv.Key, c *C) {
 		err := txn.Delete(k)
 		c.Assert(err, IsNil)
 	}
-	err := txn.Commit()
+	err := txn.Commit(goctx.Background())
 	c.Assert(err, IsNil)
 }
 
@@ -101,41 +102,10 @@ func (s *testSnapshotSuite) TestBatchGet(c *C) {
 			err := txn.Set(k, valueBytes(i))
 			c.Assert(err, IsNil)
 		}
-		err := txn.Commit()
+		err := txn.Commit(goctx.Background())
 		c.Assert(err, IsNil)
 
 		keys := makeKeys(rowNum, s.prefix)
-		s.checkAll(keys, c)
-		s.deleteKeys(keys, c)
-	}
-}
-
-func (s *testSnapshotSuite) TestBatchGetLock(c *C) {
-	for _, rowNum := range s.rowNums {
-		log.Debugf("Test BatchGetLock with length[%d]", rowNum)
-		txn := s.beginTxn(c)
-		for i := 0; i < rowNum; i++ {
-			k := encodeKey(s.prefix, s08d("key", i))
-			err := txn.Set(k, valueBytes(i))
-			c.Assert(err, IsNil)
-		}
-		err := txn.Commit()
-		c.Assert(err, IsNil)
-
-		txn2 := s.beginTxn(c)
-		txn2.DONOTCOMMIT = true
-		lockKey := encodeKey(s.prefix, s08d("key", rowNum/2))
-		err = txn2.Set(lockKey, []byte("lock"))
-		c.Assert(err, IsNil)
-		err = txn2.Commit()
-		c.Assert(err, IsNil)
-
-		keys := makeKeys(rowNum, s.prefix)
-		txn3 := s.beginTxn(c)
-		snapshot := newTiKVSnapshot(s.store, kv.Version{Ver: txn3.StartTS()})
-		_, err = snapshot.BatchGet(keys)
-		c.Assert(err, IsNil)
-
 		s.checkAll(keys, c)
 		s.deleteKeys(keys, c)
 	}
@@ -150,62 +120,13 @@ func (s *testSnapshotSuite) TestBatchGetNotExist(c *C) {
 			err := txn.Set(k, valueBytes(i))
 			c.Assert(err, IsNil)
 		}
-		err := txn.Commit()
+		err := txn.Commit(goctx.Background())
 		c.Assert(err, IsNil)
 
 		keys := makeKeys(rowNum, s.prefix)
 		keys = append(keys, kv.Key("noSuchKey"))
 		s.checkAll(keys, c)
 		s.deleteKeys(keys, c)
-	}
-}
-
-func (s *testSnapshotSuite) TestMergeResult(c *C) {
-	d1 := makeDict([]string{"1", "2"})
-	d2 := makeDict([]string{"a", "foo"})
-	d1, err := mergeResult(d1, d2)
-	c.Assert(err, IsNil)
-	r1 := makeDict([]string{"a", "foo", "1", "2"})
-	equalByteDict(c, d1, r1)
-}
-
-func (s *testSnapshotSuite) TestMergeResultNil(c *C) {
-	var d1 map[string][]byte
-	d2 := makeDict([]string{"a", "foo"})
-	d1, err := mergeResult(d1, d2)
-	c.Assert(err, IsNil)
-	r1 := makeDict([]string{"a", "foo"})
-	equalByteDict(c, d1, r1)
-
-	var d3 map[string][]byte
-	var d4 map[string][]byte
-	d3, err = mergeResult(d3, d4)
-	c.Assert(err, IsNil)
-	var r2 map[string][]byte
-	equalByteDict(c, d3, r2)
-}
-
-func (s *testSnapshotSuite) TestMergeResultConflict(c *C) {
-	d1 := makeDict([]string{"1", "2"})
-	d2 := makeDict([]string{"a", "foo", "1"})
-	d1, err := mergeResult(d1, d2)
-	c.Assert(err, NotNil)
-}
-
-func makeDict(keys []string) map[string][]byte {
-	d := make(map[string][]byte)
-	for _, k := range keys {
-		d[k] = []byte(k)
-	}
-	return d
-}
-
-func equalByteDict(c *C, lhs, rhs map[string][]byte) {
-	c.Assert(lhs, HasLen, len(rhs))
-	for k, v1 := range lhs {
-		v2, ok := rhs[k]
-		c.Assert(ok, IsTrue)
-		c.Assert(v1, BytesEquals, v2)
 	}
 }
 
